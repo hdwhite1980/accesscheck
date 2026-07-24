@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AccessLens.Cli</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AccessLens.Core\AccessLens.Core.csproj" />
+    <ProjectReference Include="..\AccessLens.Ai\AccessLens.Ai.csproj" />
+    <ProjectReference Include="..\AccessLens.Graph\AccessLens.Graph.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="appsettings.sample.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

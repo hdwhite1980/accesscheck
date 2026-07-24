@@ -1,0 +1,115 @@
+{
+  "lastSyncedUtc": "2026-07-22T00:00:00+00:00",
+  "roles": [
+    {
+      "id": "729827e3-9c14-49f7-bb1b-9608f156bbb8",
+      "displayName": "Helpdesk Administrator",
+      "description": "Can reset passwords for non-administrators and Helpdesk Administrators.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "allowedResourceActions": [
+        "microsoft.directory/users/password/update",
+        "microsoft.directory/users/invalidateAllRefreshTokens",
+        "microsoft.directory/users/standard/read",
+        "microsoft.directory/bitlockerKeys/key/read"
+      ],
+      "provider": "directory"
+    },
+    {
+      "id": "fe930be7-5e62-47db-91af-98c3a49a38b1",
+      "displayName": "User Administrator",
+      "description": "Can manage all aspects of users and groups, including resetting passwords for limited admins.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "allowedResourceActions": [
+        "microsoft.directory/users/password/update",
+        "microsoft.directory/users/invalidateAllRefreshTokens",
+        "microsoft.directory/users/standard/read",
+        "microsoft.directory/users/create",
+        "microsoft.directory/users/delete",
+        "microsoft.directory/users/basic/update",
+        "microsoft.directory/users/manager/update",
+        "microsoft.directory/groups/create",
+        "microsoft.directory/groups/delete",
+        "microsoft.directory/groups/members/update",
+        "microsoft.directory/groups/owners/update"
+      ],
+      "provider": "directory"
+    },
+    {
+      "id": "c4e39bd9-1100-46d3-8c65-fb160da0071f",
+      "displayName": "Authentication Administrator",
+      "description": "Can access to view, set and reset authentication method information for any non-admin user.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "allowedResourceActions": [
+        "microsoft.directory/users/authenticationMethods/create",
+        "microsoft.directory/users/authenticationMethods/delete",
+        "microsoft.directory/users/authenticationMethods/standard/read",
+        "microsoft.directory/users/authenticationMethods/basic/update",
+        "microsoft.directory/users/password/update",
+        "microsoft.directory/users/invalidateAllRefreshTokens",
+        "microsoft.directory/users/standard/read"
+      ],
+      "provider": "directory"
+    },
+    {
+      "id": "fdd7a751-b60b-444a-984c-02652fe8fa1c",
+      "displayName": "Groups Administrator",
+      "description": "Can manage all aspects of groups and group settings like naming and expiration policies.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "allowedResourceActions": [
+        "microsoft.directory/groups/create",
+        "microsoft.directory/groups/delete",
+        "microsoft.directory/groups/members/update",
+        "microsoft.directory/groups/owners/update",
+        "microsoft.directory/groups/basic/update",
+        "microsoft.directory/groups/standard/read"
+      ],
+      "provider": "directory"
+    },
+    {
+      "id": "9e0cc482-82df-4ab2-a24c-0e23f3f8f47c",
+      "displayName": "Help Desk Operator",
+      "description": "Performs remote tasks on devices and can view device details.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "provider": "deviceManagement",
+      "allowedResourceActions": [
+        "Microsoft.Intune_ManagedDevices_Read",
+        "Microsoft.Intune_RemoteTasks_RebootNow",
+        "Microsoft.Intune_RemoteTasks_RemoteLock",
+        "Microsoft.Intune_RemoteTasks_ResetPasscode"
+      ]
+    },
+    {
+      "id": "exo-mail-recipients",
+      "displayName": "Mail Recipients",
+      "description": "Exchange management role for modifying mailboxes and recipients.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "provider": "exchange",
+      "allowedResourceActions": [
+        "Set-Mailbox",
+        "Get-Mailbox",
+        "Set-MailUser",
+        "Get-Recipient"
+      ]
+    },
+    {
+      "id": "purview:Case Management",
+      "displayName": "Case Management",
+      "description": "Purview role for creating and managing eDiscovery cases.",
+      "isBuiltIn": true,
+      "isAccessCheckCreated": false,
+      "provider": "purview",
+      "allowedResourceActions": [
+        "Get-ComplianceCase",
+        "New-ComplianceCase",
+        "Set-ComplianceCase",
+        "Remove-ComplianceCase"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AccessLens</AssemblyName>
+    <RootNamespace>AccessLens.App</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AccessLens.Core\AccessLens.Core.csproj" />
+    <ProjectReference Include="..\AccessLens.Ai\AccessLens.Ai.csproj" />
+    <ProjectReference Include="..\AccessLens.Graph\AccessLens.Graph.csproj" />
+    <ProjectReference Include="..\AccessLens.PowerShell\AccessLens.PowerShell.csproj" />
+  </ItemGroup>
+</Project>

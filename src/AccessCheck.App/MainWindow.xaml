@@ -1,0 +1,836 @@
+<Window x:Class="AccessCheck.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AccessCheck — Least-Privilege Access Broker"
+        Width="1180" Height="820"
+        Background="{StaticResource PageBg}"
+        Loaded="Window_Loaded">
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Background="{StaticResource Steel}" Padding="16,10">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="AccessCheck" Foreground="White" FontSize="20" FontWeight="Bold"/>
+                <TextBlock x:Name="HeaderStatus" Foreground="#C9D6E6" FontSize="12"
+                           Margin="18,6,0,0" Text="Not signed in"/>
+                <TextBlock x:Name="HeaderVersion" Foreground="#8FA6C4" FontSize="11"
+                           Margin="14,7,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <TextBlock x:Name="StatusText" Text="Ready."/>
+        </StatusBar>
+
+        <TabControl x:Name="Tabs" Margin="10">
+
+            <!-- ================= REQUEST ================= -->
+            <!-- ================= HOME / SETUP ================= -->
+            <TabItem Header="Home">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="18" MaxWidth="1100" HorizontalAlignment="Left">
+
+                        <TextBlock Style="{StaticResource H1}" Text="Set up AccessCheck"/>
+                        <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                   Text="Work down this list. Each step says what it does and why it matters, and reports its own state — nothing here changes your tenant. Green means verified against your tenant just now, not merely configured."/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,12,0,10">
+                            <Button x:Name="RunAllChecksButton" Content="Run all checks"
+                                    Click="RunAllChecks_Click"/>
+                            <TextBlock x:Name="SetupSummary" Margin="14,7,0,0"
+                                       Style="{StaticResource Hint}"/>
+                        </StackPanel>
+
+                        <!-- 1. Sign in -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock x:Name="StepSignInGlyph" Text="?" FontSize="18"
+                                               FontWeight="Bold" Width="26"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <TextBlock Text="1. Sign in to Microsoft Graph" FontSize="15"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                           Text="Interactive sign-in with no client secret, so every read and every write is attributed to YOUR admin account in the tenant audit log — not to a service principal nobody can trace. A browser window opens."/>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="StepSignInButton" Content="Sign in"
+                                            Click="StepSignIn_Click"/>
+                                    <Button x:Name="StepScopesButton" Content="Check permissions"
+                                            Click="CheckScopes_Click" Margin="8,0,0,0"/>
+                                    <TextBlock x:Name="StepSignInStatus" Margin="12,7,0,0"
+                                               Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 2. Per-service reachability -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock x:Name="StepServicesGlyph" Text="?" FontSize="18"
+                                               FontWeight="Bold" Width="26"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <TextBlock Text="2. Which services can this account read?"
+                                               FontSize="15" FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                           Text="Probes each RBAC provider with a real read. A service you are not licensed for fails here and that is expected — the app degrades per provider rather than refusing to start. What matters is knowing WHICH ones you have before you rely on a recommendation."/>
+                                <ItemsControl x:Name="ServiceStatusList" Margin="0,8,0,0">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal" Margin="0,3,0,3">
+                                                <TextBlock Text="{Binding Glyph}" Width="26"
+                                                           FontWeight="Bold" FontSize="15"
+                                                           Foreground="{Binding Colour}"/>
+                                                <TextBlock Text="{Binding Service}" Width="200"/>
+                                                <TextBlock Text="{Binding Detail}" TextWrapping="Wrap"
+                                                           Foreground="#555" Width="700"/>
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                                <Button x:Name="StepServicesButton" Content="Probe services"
+                                        Click="StepServices_Click" Margin="0,8,0,0"
+                                        HorizontalAlignment="Left"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 3. PowerShell, announced BEFORE it launches -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock x:Name="StepPsGlyph" Text="?" FontSize="18"
+                                               FontWeight="Bold" Width="26"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <TextBlock Text="3. Exchange and Purview (PowerShell)"
+                                               FontSize="15" FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                           Text="These two services have no Graph write API, so the app drives PowerShell. IMPORTANT: a console window will open and stay open while it connects, and you will be prompted to sign in again — that is the ExchangeOnlineManagement module, not this app. The button below tells you exactly which service is about to connect before anything launches."/>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="StepPsCheckButton" Content="Check PowerShell prerequisites"
+                                            Click="StepPsCheck_Click"/>
+                                    <Button x:Name="StepPsConnectButton" Content="Connect Exchange &amp; Purview…"
+                                            Click="StepPsConnect_Click" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <TextBlock x:Name="StepPsStatus" Margin="0,8,0,0"
+                                           Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 4. Catalog -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock x:Name="StepCatalogGlyph" Text="?" FontSize="18"
+                                               FontWeight="Bold" Width="26"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <TextBlock Text="4. Sync the permission catalog" FontSize="15"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                           Text="Reads every role your tenant actually defines and derives the permission vocabulary from them. This is the single most important step: every AI suggestion is validated against it, so a permission the model invents is rejected rather than granted. Without it the app cannot recommend anything."/>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="StepCatalogButton" Content="Sync catalog now"
+                                            Click="Sync_Click"/>
+                                    <Button x:Name="StepGroupsButton" Content="Then sync groups"
+                                            Click="GroupSync_Click" Margin="8,0,0,0"
+                                            ToolTip="Optional but worth it: finds every group that already carries a role, so New Request can offer an existing group instead of minting another role."/>
+                                    <TextBlock x:Name="StepCatalogStatus" Margin="12,7,0,0"
+                                               Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 5. AI endpoint -->
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock x:Name="StepAiGlyph" Text="?" FontSize="18"
+                                               FontWeight="Bold" Width="26"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <TextBlock Text="5. Verify the AI endpoint" FontSize="15"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                           Text="Sends a tiny probe to confirm the endpoint answers and the key works, and checks that the tenant you are signed in to is the tenant this app is configured for. The endpoint only ever receives a job description plus role and permission NAMES — never a username, object id, or tenant id."/>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="StepAiButton" Content="Verify AI + tenant"
+                                            Click="StepAiVerify_Click"/>
+                                    <TextBlock x:Name="StepAiStatus" Margin="12,7,0,0"
+                                               Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Tutorial, skippable -->
+                        <Border x:Name="TutorialCard" Style="{StaticResource Card}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="How this app thinks" FontSize="15"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource Steel}"/>
+                                    <Button x:Name="SkipTutorialButton" Content="Skip"
+                                            Click="SkipTutorial_Click" Margin="14,0,0,0"/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="You describe a job in plain English. An AI proposes the permissions it needs. Everything after that is deterministic code working against your tenant's real catalog — the AI never decides what gets granted."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,8,0,0"
+                                           Text="1. WHICH SERVICE owns the feature? Product names like &quot;GPO analytics&quot; appear in no permission string, so the app asks this first — or you name it yourself with the Service picker."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Text="2. WHICH PERMISSIONS from that service? The model chooses from your tenant's real vocabulary, narrowest first. Permissions are named after the RESOURCE they act on, never after the feature — so &quot;read device configurations and security baselines&quot; is what GPO analytics actually needs."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Text="3. VALIDATION, by code. Anything not in your catalog is rejected. Covering roles are ranked by risk-weighted excess — five extra admin permissions rank worse than six extra reads. A custom role is drafted only when the best existing role over-grants beyond your threshold."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Text="4. GUARDS, also by code. Service-wide grants, scope creep, wrong-resource collisions, limits no permission can express, and capabilities RBAC does not grant at all. These appear ABOVE the verdict because they change how it should be read."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Text="5. YOU APPROVE. Nothing reaches the tenant until you confirm a plan that restates exactly what will happen and what will not expire on its own."/>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,8,0,0"
+                                           Text="The Guide tab has the full walkthrough and the strategies that make this work in practice."/>
+                            </StackPanel>
+                        </Border>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="New Request">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="14" MaxWidth="1050">
+                        <TextBlock Style="{StaticResource H1}" Text="Describe the function the user needs to perform"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Plain English. The GenAI endpoint sees only this text plus role names and action lists from your synced catalog — never a username or tenant ID. Its suggestion is then validated deterministically: unknown actions are rejected, covering roles are ranked by over-privilege delta per service."/>
+                        <TextBox x:Name="FunctionText" Margin="0,10,0,8" Height="64"
+                                 TextWrapping="Wrap" AcceptsReturn="True"
+                                 FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
+                            <Button x:Name="RecommendButton" Content="Analyze &amp; Recommend" Click="Recommend_Click"/>
+                            <TextBlock Text="Service" Margin="14,7,0,0" Style="{StaticResource Hint}"/>
+                            <ComboBox x:Name="ForcedProviderBox" Width="210" Margin="6,0,0,0"
+                                      ToolTip="Which service owns this feature. Auto-detect asks the model, which is the judgement it gets wrong most often — naming it yourself removes that risk entirely."/>
+                            <CheckBox x:Name="UseDemoCheck" Content="Offline demo suggester (no GenAI call)"
+                                      Margin="16,6,0,0"/>
+                        </StackPanel>
+
+                        <TextBlock x:Name="ReasoningText" Style="{StaticResource Hint}" Margin="0,0,0,10"/>
+
+                        <StackPanel x:Name="OutcomesPanel"/>
+
+                        <StackPanel x:Name="GroupMatchPanel"/>
+
+                        <Border Style="{StaticResource Card}" x:Name="ExecutePanel" Visibility="Collapsed">
+                            <StackPanel>
+                                <TextBlock Style="{StaticResource H1}" Text="Approve and execute"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="220"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Text="Principal (recipient)" Grid.Row="0" Margin="0,6"/>
+                                    <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                                        <TextBox x:Name="PrincipalBox" Width="340"
+                                                 ToolTip="Entra object ID of the user receiving access — or use Find user."/>
+                                        <Button x:Name="FindUserButton" Content="Find user…" Click="FindUser_Click"
+                                                Margin="8,0,0,0"
+                                                ToolTip="Search the tenant by name or UPN; selecting fills the object ID and the UPN field automatically. Requires User.Read.All consent."/>
+                                        <TextBlock x:Name="PrincipalDisplay" Margin="10,6,0,0" Style="{StaticResource Hint}"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Duration" Grid.Row="1" Margin="0,6"
+                                               ToolTip="Human-friendly ('14 days', '8 hours', '2 weeks', '1 month') or raw ISO 8601 ('P14D'). Converted automatically. Enter 'never' (or 'permanent' / 'no expiry') for a grant that never expires — nothing will auto-remove it, and it is flagged as permanent in the audit history."/>
+                                    <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                                        <TextBox x:Name="DurationBox" Width="180" Text="14 days"
+                                                 TextChanged="Duration_TextChanged"/>
+                                        <TextBlock x:Name="DurationPreview" Margin="10,6,0,0" Style="{StaticResource Hint}"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Directory assignment type" Grid.Row="2" Margin="0,6"/>
+                                    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,6">
+                                        <RadioButton x:Name="ActiveRadio" Content="Active (live now, PIM expires it)"
+                                                     GroupName="AType" IsChecked="True"/>
+                                        <RadioButton x:Name="EligibleRadio" Content="Eligible (user self-activates, max 8h)"
+                                                     GroupName="AType" Margin="18,0,0,0"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Group (optional)" Grid.Row="3" Margin="0,6"
+                                               ToolTip="For Intune / Windows 365 / Defender grants: a group that already holds the role. The user is added to this group instead of being assigned the role directly."/>
+                                    <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                                        <TextBox x:Name="PimGroupBox" Width="250"
+                                                 ToolTip="Group OBJECT ID (GUID). A display name typed here is resolved automatically at approval, but picking with Find group is safer."/>
+                                        <Button x:Name="FindGroupButton" Content="Find group…" Click="FindGroup_Click"
+                                                Margin="8,0,0,0"
+                                                ToolTip="Search existing groups and fill the object ID. Shows which groups are role-assignable — required if the group will carry Entra directory roles."/>
+                                        <Button x:Name="NewGroupButton" Content="New group…" Click="NewGroup_Click"
+                                                Margin="8,0,0,0"
+                                                ToolTip="Creates an empty Entra security group and fills this box. Tick role-assignable if it will ever carry an Entra DIRECTORY role — that flag is set at creation and can never be changed afterwards."/>
+                                        <Button x:Name="SetupPimButton" Content="Set up PIM group…" Click="SetupPimGroup_Click"
+                                                Margin="8,0,0,0"
+                                                ToolTip="Automates the pre-staging for the selected Intune/Windows 365/Defender grant: creates a security group, attaches the chosen role to it, and fills this box. The group onboards to PIM automatically at its first time-bound membership grant. Requires Group.ReadWrite.All consent; members need Entra ID Governance/P2 licensing for PIM."/>
+                                    </StackPanel>
+                                    <TextBlock Text="Directory scope" Grid.Row="6" Margin="0,6"
+                                               ToolTip="Entra directory roles can be narrowed to an Administrative Unit instead of the whole tenant. Scoping is itself a least-privilege control."/>
+                                    <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                                        <TextBox x:Name="ScopeBox" Width="250" Text="/" IsReadOnly="True"
+                                                 ToolTip="/ means tenant-wide."/>
+                                        <Button x:Name="PickScopeButton" Content="Scope to AU…" Click="PickScope_Click"
+                                                Margin="8,0,0,0"/>
+                                        <Button x:Name="ClearScopeButton" Content="Tenant-wide" Click="ClearScope_Click"
+                                                Margin="6,0,0,0"/>
+                                        <TextBlock x:Name="ScopeDisplay" Margin="10,6,0,0" Style="{StaticResource Hint}"
+                                                   Text="tenant-wide"/>
+                                    </StackPanel>
+                                    <TextBlock Text="Group grant mode" Grid.Row="4" Margin="0,6"
+                                               ToolTip="How the user is put into that group."/>
+                                    <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="0,6">
+                                        <RadioButton x:Name="GroupPimRadio" GroupName="GMode" IsChecked="True"
+                                                     Checked="GroupMode_Changed"
+                                                     Content="PIM time-bound (Entra removes membership on schedule)"
+                                                     ToolTip="Uses PIM for Groups. Expiry is enforced server-side even if this machine is off. Requires Entra ID Governance/P2 licensing and is subject to the group's PIM policy rules."/>
+                                        <RadioButton x:Name="GroupDirectRadio" GroupName="GMode" Margin="18,0,0,0"
+                                                     Checked="GroupMode_Changed"
+                                                     Content="Direct membership (no expiry — remove by hand)"
+                                                     ToolTip="Plain group membership. No PIM licensing and no policy validation, but NO server-side expiry — the membership stays until Housekeeping runs and removes it at the tracked expiry."/>
+                                    </StackPanel>
+                                    <TextBlock Text="Principal UPN (Exchange/Purview)" Grid.Row="5" Margin="0,6"
+                                               ToolTip="Exchange and Purview cmdlets take a UPN, not an object ID. Required only when an Exchange/Purview grant is selected."/>
+                                    <TextBox x:Name="UpnBox" Grid.Row="5" Grid.Column="1" Margin="0,4"/>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                    <TextBlock Text="Add permission:" Margin="0,6,8,0"
+                                               ToolTip="Manually add a resource action / cmdlet to this request before execution. It must exist in the synced catalog; the whole request is re-validated (roles, deltas, custom-role drafts recompute) and the addition is recorded in the audit trail as human-added."/>
+                                    <TextBox x:Name="ManualActionBox" Width="420"
+                                             TextChanged="ManualAction_TextChanged"
+                                             ToolTip="Start typing — matching catalog permissions appear below; click one to select it, then Add."/>
+                                    <Button x:Name="AddActionButton" Content="Add &amp; re-validate"
+                                            Click="AddAction_Click" Margin="8,0,0,0"/>
+                                    <Button x:Name="AskAiActionButton" Content="Ask AI…" Click="AskAiAction_Click"
+                                            Margin="8,0,0,0"
+                                            ToolTip="Describe what the person needs to do in plain language; the AI proposes matching permissions from your catalog (validated — it can only pick actions that exist)."/>
+                                </StackPanel>
+                                <ListBox x:Name="ActionSuggestList" MaxHeight="150" Margin="0,2,0,0"
+                                         Visibility="Collapsed" FontFamily="Consolas" FontSize="12"
+                                         MouseUp="ActionSuggestList_MouseUp"/>
+                                <TextBlock x:Name="ManualActionsText" Style="{StaticResource Hint}" Margin="0,6,0,0"/>
+                                <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,8"
+                                           Text="Directory grants use PIM schedule requests — Entra removes access on schedule even if this machine is off. Intune / Windows 365 / Defender have no PIM: put the user in a group that holds the role. Two modes: PIM time-bound keeps expiry server-side (needs Governance/P2 and obeys the group's PIM policy), Direct membership always works and NEVER expires on its own — Housekeeping only lists it for you to remove by hand. With no group, the role is assigned directly and Housekeeping lists it at expiry for you to remove. IMPORTANT: Intune RBAC assigns roles to SECURITY GROUPS, not individual users — for Intune, the PIM group path is the reliable one. Exchange and Purview grants run as PowerShell (shown for review before anything executes): a derived custom role with the exact cmdlets when needed, carried by a per-grant ACG- role group; Housekeeping lists expired membership and empty groups/roles; you tick what to remove."/>
+                                <Button x:Name="ExecuteButton" Content="Approve selected grants…" Click="Execute_Click"
+                                        HorizontalAlignment="Left"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ================= CATALOG ================= -->
+            <!-- ================= ACCESS REVIEW ================= -->
+            <TabItem Header="Access Review">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="14" MaxWidth="1080">
+                        <TextBlock Style="{StaticResource H1}" Text="Review a user's existing access"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Loads every role the user holds — active, PIM-eligible, and inherited through groups — expands each to its exact permissions, then compares that against what they actually do. The over-privilege verdict is computed deterministically from your synced catalog; the AI only explains the risk and proposes right-sized roles."/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                            <TextBox x:Name="ReviewPrincipalBox" Width="330"
+                                     ToolTip="Entra object ID of the user to review — or use Find user."/>
+                            <Button x:Name="ReviewFindButton" Content="Find user…" Click="ReviewFindUser_Click"
+                                    Margin="8,0,0,0"/>
+                            <Button x:Name="ReviewLoadButton" Content="Load current access"
+                                    Click="ReviewLoad_Click" Margin="8,0,0,0"/>
+                            <Button x:Name="ReviewDetailsButton" Content="Details…"
+                                    Click="ReviewDetails_Click" Margin="8,0,0,0"
+                                    ToolTip="Everything the read logged, including expected conditions like unlicensed services."/>
+                            <TextBlock x:Name="ReviewUserDisplay" Margin="12,7,0,0" Style="{StaticResource Hint}"/>
+                        </StackPanel>
+
+                        <TextBlock x:Name="ReviewWarnings" Style="{StaticResource Hint}"
+                                   Foreground="#B26A00" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                        <DataGrid x:Name="ReviewRolesGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                                  HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                                  MaxHeight="220" Margin="0,10,0,0">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="170"/>
+                                <DataGridTextColumn Header="Role" Binding="{Binding Role}" Width="240"/>
+                                <DataGridTextColumn Header="How granted" Binding="{Binding Path}" Width="200"/>
+                                <DataGridTextColumn Header="Actions" Binding="{Binding ActionCount}" Width="70"/>
+                                <DataGridTextColumn Header="Scope" Binding="{Binding Scope}" Width="*"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+
+                        <TextBlock Style="{StaticResource H1}" Text="What does this person actually do?"
+                                   Margin="0,16,0,4"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Plain English, same as a new request. Only this text and role/action names leave the machine — never the user's identity."/>
+                        <TextBox x:Name="ReviewFunctionText" Height="60" Margin="0,8,0,8"
+                                 TextWrapping="Wrap" AcceptsReturn="True" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal">
+                            <Button x:Name="ReviewAnalyzeButton" Content="Analyze access"
+                                    Click="ReviewAnalyze_Click"/>
+                            <CheckBox x:Name="ReviewDemoCheck" Content="Offline demo suggester (no AI call)"
+                                      Margin="16,6,0,0"/>
+                        </StackPanel>
+
+                        <StackPanel x:Name="ReviewResultPanel" Margin="0,14,0,0"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ================= GROUPS ================= -->
+            <TabItem Header="Groups">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top">
+                        <TextBlock Style="{StaticResource H1}" Text="Groups that carry roles"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Every group in the tenant that holds a role — directory (active and PIM-eligible), Intune, Windows 365 and Defender — expanded to the exact permissions those roles grant. New Request uses this to tell you whether an existing group already covers a request, so adding someone to a proven group replaces guessing at a new role."/>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,10">
+                            <Button x:Name="GroupSyncButton" Content="Sync groups" Click="GroupSync_Click"/>
+                            <Button x:Name="ViewGroupPermsButton" Content="View permissions…"
+                                    Click="ViewGroupPerms_Click" Margin="10,0,0,0"
+                                    ToolTip="Open the selected group's permissions (or just double-click the row). From there, double-click any permission to see every group that grants it."/>
+                            <Button x:Name="AssignRoleToGroupButton" Content="Assign role to group…"
+                                    Click="AssignRoleToGroup_Click" Margin="10,0,0,0"
+                                    ToolTip="Give a group a role, so the group can then grant that access to anyone you add to it. This is the pre-staging step: assign the role once to the group, then time-bound access by managing membership."/>
+                            <Button x:Name="InspectGroupButton" Content="Inspect a group…" Click="InspectGroup_Click"
+                                    Margin="10,0,0,0"
+                                    ToolTip="Pick one group and see every surface a role could be attached to — directory active and eligible, Intune (both endpoints), Windows 365, Defender, parent-group inheritance, and PIM for Groups — including the ones that return nothing. Use this when a group 'should' have roles but isn't listed."/>
+                            <Button x:Name="GroupSyncReportButton" Content="Details…" Click="GroupSyncReport_Click"
+                                    Margin="10,0,0,0"
+                                    ToolTip="Per-source counts, how many principals hold roles, how many are groups, and why any source was skipped."/>
+                            <TextBlock x:Name="GroupSyncSummary" Margin="14,7,0,0" Style="{StaticResource Hint}"/>
+                        </StackPanel>
+                        <TextBlock x:Name="GroupSyncWarnings" Style="{StaticResource Hint}"
+                                   Foreground="#B26A00" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                        <TextBox x:Name="GroupFilter" Width="320" HorizontalAlignment="Left"
+                                 Margin="0,0,0,8" TextChanged="GroupFilter_TextChanged"
+                                 ToolTip="Filter by group name, role name, or permission"/>
+                    </StackPanel>
+                    <DataGrid x:Name="GroupsGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              MouseDoubleClick="GroupsGrid_MouseDoubleClick"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                              CanUserSortColumns="True"
+                              EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                              ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                              ScrollViewer.CanContentScroll="True">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Group" Binding="{Binding Name}" Width="260"/>
+                            <DataGridTextColumn Header="Roles held" Binding="{Binding Roles}" Width="320"/>
+                            <DataGridTextColumn Header="Services" Binding="{Binding Services}" Width="180"/>
+                            <DataGridTextColumn Header="Permissions" Binding="{Binding ActionCount}" Width="90"/>
+                            <DataGridTextColumn Header="Role-assignable" Binding="{Binding RoleAssignable}" Width="110"/>
+                            <DataGridTextColumn Header="Group ID" Binding="{Binding GroupId}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= APPLICATIONS ================= -->
+            <TabItem Header="Applications">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top">
+                        <TextBlock Style="{StaticResource H1}" Text="What applications can do"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Service principals and their granted API permissions — application (app-only) permissions run with no signed-in user, never expire, are invisible to user access reviews, and no PIM policy touches them. This is where standing privilege accumulates. High-risk grants (ReadWrite, RoleManagement, AppRoleAssignment, Directory.ReadWrite, PrivilegedAccess, Application.ReadWrite) are counted separately, and any directory role an app holds is shown."/>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,10">
+                            <Button x:Name="AppScanButton" Content="Scan applications" Click="AppScan_Click"/>
+                            <CheckBox x:Name="AppOnlyWithPermsCheck" Content="Only apps holding permissions or roles"
+                                      IsChecked="True" Margin="16,7,0,0"/>
+                            <TextBlock x:Name="AppScanSummary" Margin="14,7,0,0" Style="{StaticResource Hint}"/>
+                        </StackPanel>
+                        <TextBlock x:Name="AppScanWarnings" Style="{StaticResource Hint}"
+                                   Foreground="#B26A00" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                        <TextBox x:Name="AppFilter" Width="320" HorizontalAlignment="Left"
+                                 Margin="0,0,0,8" TextChanged="AppFilter_TextChanged"
+                                 ToolTip="Filter by application name or permission"/>
+                    </StackPanel>
+                    <DataGrid x:Name="AppsGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                              CanUserSortColumns="True"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Application" Binding="{Binding Name}" Width="240"/>
+                            <DataGridTextColumn Header="High risk" Binding="{Binding HighRisk}" Width="80"/>
+                            <DataGridTextColumn Header="App-only" Binding="{Binding AppOnly}" Width="80"/>
+                            <DataGridTextColumn Header="Total perms" Binding="{Binding Total}" Width="90"/>
+                            <DataGridTextColumn Header="Directory roles" Binding="{Binding Roles}" Width="200"/>
+                            <DataGridTextColumn Header="Permissions" Binding="{Binding Permissions}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <TabItem Header="Catalog">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top">
+                        <TextBlock Style="{StaticResource H1}" Text="Tenant permission catalog"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Live sync across every service: Entra directory (Graph v1.0), Intune, Windows 365, Defender XDR (Graph beta), and — via PowerShell — Exchange Online and Purview / Security &amp; Compliance at cmdlet level (Get-ManagementRole + role entries), which is the exact vocabulary derived custom roles are built from. Providers your licenses or consents don't cover are skipped and listed — the catalog is always your tenant's current truth, never a shipped list."/>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,10">
+                            <Button x:Name="SyncButton" Content="Sync all providers" Click="Sync_Click"/>
+                            <Button x:Name="AzureSyncButton" Content="Sync Azure RBAC" Click="AzureSync_Click"
+                                    Margin="10,0,0,0"
+                                    ToolTip="Reads Azure Resource Manager role definitions and assignments across every subscription you can see. Separate API and token — signs you in again the first time."/>
+                            <Button x:Name="SyncReportButton" Content="Sync report…" Click="SyncReport_Click"
+                                    Margin="10,0,0,0"
+                                    ToolTip="Full per-provider detail: exact HTTP status, which permission is likely missing, and the PowerShell host in use."/>
+                            <CheckBox x:Name="ExoSyncCheck" Margin="16,7,0,0" IsChecked="True"
+                                      Content="Include Exchange &amp; Purview via PowerShell (cmdlet-level; needs pwsh + ExchangeOnlineManagement)"/>
+                        </StackPanel>
+                        <TextBlock x:Name="SyncSummary" Margin="0,0,0,8" Style="{StaticResource Hint}"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <RadioButton x:Name="CatalogRolesMode" GroupName="CatMode" IsChecked="True"
+                                         Content="Roles" Checked="CatalogMode_Changed" Margin="0,4,0,0"
+                                         ToolTip="What each role grants."/>
+                            <RadioButton x:Name="CatalogPermsMode" GroupName="CatMode"
+                                         Content="Permissions" Checked="CatalogMode_Changed"
+                                         Margin="14,4,0,0"
+                                         ToolTip="Every permission the tenant defines, independent of roles. This is the view a least-privilege decision actually starts from: what exists for this task, and which is narrowest."/>
+                            <ComboBox x:Name="PermProviderFilter" Width="200" Margin="18,0,0,0"
+                                      Visibility="Collapsed"
+                                      SelectionChanged="PermProviderFilter_Changed"
+                                      ToolTip="Limit to one service"/>
+                            <TextBlock x:Name="PermCountText" Margin="14,6,0,0" Style="{StaticResource Hint}"/>
+                        </StackPanel>
+                        <TextBox x:Name="CatalogFilter" Width="320" HorizontalAlignment="Left"
+                                 Margin="0,0,0,8" TextChanged="CatalogFilter_TextChanged"
+                                 ToolTip="Filter by role, service, or permission"/>
+                    </StackPanel>
+                    <DataGrid x:Name="PermissionsGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                              Visibility="Collapsed" CanUserSortColumns="True"
+                              MouseDoubleClick="PermissionsGrid_MouseDoubleClick"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Permission" Binding="{Binding Action}" Width="420"/>
+                            <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="80"/>
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="170"/>
+                            <DataGridTextColumn Header="Roles" Binding="{Binding RoleCount}" Width="60"/>
+                            <DataGridTextColumn Header="Granted by" Binding="{Binding GrantedBy}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DataGrid x:Name="CatalogGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="180"/>
+                            <DataGridTextColumn Header="Role" Binding="{Binding Name}" Width="300"/>
+                            <DataGridTextColumn Header="Built-in" Binding="{Binding BuiltIn}" Width="70"/>
+                            <DataGridTextColumn Header="Actions" Binding="{Binding ActionCount}" Width="70"/>
+                            <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= HISTORY ================= -->
+            <!-- ================= REFERENCE ================= -->
+            <TabItem Header="Reference">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top">
+                        <TextBlock Style="{StaticResource H1}"
+                                   Text="Microsoft's permission reference"/>
+                        <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                   Text="Microsoft's OWN list of every permission Entra defines, read live from /roleManagement/directory/resourceNamespaces — not scraped from a documentation page, so it is always current and works in the US Gov and DoD clouds. It carries Microsoft's descriptions and their authoritative isPrivileged flag. Your Catalog is DERIVED from the roles your tenant happens to define, so a permission Microsoft supports but no role grants is invisible there — which matters most when drafting a custom role."/>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,10">
+                            <Button x:Name="RefSyncButton" Content="Sync from Microsoft"
+                                    Click="RefSync_Click"/>
+                            <Button x:Name="RefExoButton" Content="Add Exchange &amp; Purview"
+                                    Click="RefExo_Click" Margin="10,0,0,0"
+                                    ToolTip="Those two services do not use unified RBAC, so Microsoft publishes no Graph reference for them. Their vocabulary comes from the role entries already synced through PowerShell."/>
+                            <ComboBox x:Name="RefProviderFilter" Width="200" Margin="10,0,0,0"
+                                      SelectionChanged="RefProviderFilter_Changed"
+                                      ToolTip="Limit to one service"/>
+                            <Button x:Name="RefDocsButton" Content="Open the docs…"
+                                    Click="RefDocs_Click" Margin="10,0,0,0"
+                                    ToolTip="Opens Microsoft's role and permission reference in a browser for the prose explanations."/>
+                            <TextBlock x:Name="RefSummary" Margin="14,7,0,0"
+                                       Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <RadioButton x:Name="RefAllMode" GroupName="RefMode" IsChecked="True"
+                                         Content="All Microsoft permissions" Checked="RefMode_Changed"
+                                         Margin="0,4,0,0"/>
+                            <RadioButton x:Name="RefGapMode" GroupName="RefMode"
+                                         Content="Not granted by any role you have"
+                                         Checked="RefMode_Changed" Margin="14,4,0,0"
+                                         ToolTip="Microsoft defines these, but no role in your tenant grants them. To use one, a custom role is the only route."/>
+                            <RadioButton x:Name="RefRiskMode" GroupName="RefMode"
+                                         Content="Where Microsoft disagrees with this app's risk rating"
+                                         Checked="RefMode_Changed" Margin="14,4,0,0"
+                                         ToolTip="This app infers privileged/read from the action name. Microsoft states it. These are the ones where the guess is wrong."/>
+                            <TextBox x:Name="RefFilter" Width="280" Margin="18,0,0,0"
+                                     TextChanged="RefFilter_TextChanged"
+                                     ToolTip="Filter by permission or description"/>
+                        </StackPanel>
+                        <TextBlock x:Name="RefWarnings" Style="{StaticResource Hint}"
+                                   Foreground="#B26A00" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                    </StackPanel>
+                    <DataGrid x:Name="ReferenceGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                              CanUserSortColumns="True"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Permission" Binding="{Binding Name}" Width="340"/>
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="150"/>
+                            <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="150"/>
+                            <DataGridTextColumn Header="Microsoft says" Binding="{Binding Risk}" Width="110"/>
+                            <DataGridTextColumn Header="This app infers" Binding="{Binding AppRisk}" Width="110"/>
+                            <DataGridTextColumn Header="In your roles" Binding="{Binding InCatalog}" Width="100"/>
+                            <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <TabItem Header="History">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource H1}" Text="Audit history"/>
+                        <Button Content="Refresh" Click="HistoryRefresh_Click" Margin="16,0,0,8"/>
+                    </StackPanel>
+                    <DataGrid x:Name="HistoryGrid" AutoGenerateColumns="False" IsReadOnly="True"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="When (UTC)" Binding="{Binding When}" Width="140"/>
+                            <DataGridTextColumn Header="Function" Binding="{Binding Function}" Width="260"/>
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="150"/>
+                            <DataGridTextColumn Header="Role" Binding="{Binding Role}" Width="200"/>
+                            <DataGridTextColumn Header="Delta" Binding="{Binding Delta}" Width="55"/>
+                            <DataGridTextColumn Header="Added" Binding="{Binding Added}" Width="55"/>
+                            <DataGridTextColumn Header="Approved" Binding="{Binding Approved}" Width="80"/>
+                            <DataGridTextColumn Header="Expiry" Binding="{Binding Expiry}" Width="140"/>
+                            <DataGridTextColumn Header="Notes" Binding="{Binding Notes}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= HOUSEKEEPING ================= -->
+            <TabItem Header="Housekeeping">
+                <DockPanel Margin="14">
+                    <StackPanel DockPanel.Dock="Top">
+                        <TextBlock Style="{StaticResource H1}" Text="Housekeeping"/>
+                        <TextBlock Style="{StaticResource Hint}"
+                                   Text="Scanning NEVER removes anything. It reports expired grants and orphaned objects, and you tick exactly what you want gone before anything is deleted. Directory PIM grants are not listed — Entra expires those itself."/>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,10">
+                            <Button x:Name="HousekeepingButton" Content="Scan (read-only)"
+                                    Click="Housekeeping_Click"/>
+                            <Button x:Name="HousekeepingRemoveButton" Content="Remove selected…"
+                                    Click="HousekeepingRemove_Click" Margin="10,0,0,0" IsEnabled="False"
+                                    ToolTip="Removes only the ticked items, after a confirmation listing them."/>
+                            <Button x:Name="HousekeepingSelectAllButton" Content="Tick all"
+                                    Click="HousekeepingSelectAll_Click" Margin="10,0,0,0" IsEnabled="False"/>
+                            <Button x:Name="HousekeepingSelectNoneButton" Content="Untick all"
+                                    Click="HousekeepingSelectNone_Click" Margin="6,0,0,0" IsEnabled="False"/>
+                            <TextBlock x:Name="HousekeepingSummary" Margin="14,7,0,0"
+                                       Style="{StaticResource Hint}"/>
+                        </StackPanel>
+                    </StackPanel>
+
+                    <TextBox x:Name="HousekeepingLog" DockPanel.Dock="Bottom" Height="180" IsReadOnly="True"
+                             VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
+                             FontFamily="Consolas" FontSize="12" Margin="0,10,0,0"/>
+
+                    <DataGrid x:Name="HousekeepingGrid" AutoGenerateColumns="False"
+                              HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                              CanUserSortColumns="True"
+                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <DataGrid.Columns>
+                            <DataGridCheckBoxColumn Header="Remove" Binding="{Binding Selected, Mode=TwoWay,
+                                                    UpdateSourceTrigger=PropertyChanged}" Width="70"/>
+                            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="200" IsReadOnly="True"/>
+                            <DataGridTextColumn Header="What" Binding="{Binding Description}" Width="*" IsReadOnly="True"/>
+                            <DataGridTextColumn Header="Expired" Binding="{Binding Expired}" Width="150" IsReadOnly="True"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= SETTINGS ================= -->
+            <!-- ================= GUIDE ================= -->
+            <TabItem Header="Guide">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="18" MaxWidth="1100" HorizontalAlignment="Left">
+
+                        <TextBlock Style="{StaticResource H1}" Text="Using AccessCheck well"/>
+                        <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                   Text="An access broker nobody understands gets clicked through, and clicking through is how over-privilege happens. This explains the reasoning, not just the buttons."/>
+
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="Writing a good request" FontSize="15" FontWeight="SemiBold"
+                                           Foreground="{StaticResource Steel}"/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="DESCRIBE THE JOB, NOT THE ROLE. &quot;Reset passwords for the service desk&quot; works. &quot;Give them Password Administrator&quot; defeats the point — you have already made the decision the tool exists to check."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="DESCRIBE THE RESOURCE, NOT THE FEATURE. Permissions are named after what they act on. There is no &quot;GPO analytics&quot; permission — that feature reads device configuration profiles and security baselines, and those are the permissions. The app knows many of these mappings, but phrasing it as what is read or changed always works better."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="SET THE SERVICE WHEN YOU KNOW IT. The Service picker beside Analyze removes the one judgement the model gets wrong most often. Auto-detect is fine; explicit is better."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="SAY WHAT THEY MUST NOT DO. &quot;But not administrators&quot;, &quot;only for their own team&quot;, &quot;without being able to change anything&quot; — the app detects these and tells you which mechanism actually enforces them, because no permission can."/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="Reading the verdict" FontSize="15" FontWeight="SemiBold"
+                                           Foreground="{StaticResource Steel}"/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="WARNINGS COME FIRST, deliberately. A recommendation sitting under a red card is not a recommendation to act on."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="&quot;ZERO EXCESS&quot; IS NOT ALWAYS GOOD. If the single permission granted is a service-wide action, zero excess is arithmetic, not safety — the action IS the whole service. The breadth guard flags exactly this and lists narrower alternatives."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="EXCESS IS RISK-WEIGHTED. Roles rank by what the extra permissions LET SOMEONE DO. A role with five extra admin permissions ranks worse than one with six extra reads, which is the opposite of what a raw count would tell you."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="BUILT-IN CAN BEAT CUSTOM. A custom role with exactly the needed permissions is minimal, but a restricted built-in role may be SAFER: Password Administrator cannot touch privileged accounts, while a custom role built from the raw password permission can. Fewer permissions is not always less privilege."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="THE THRESHOLD IS YOURS. Settings controls how much excess is acceptable before a custom role is drafted instead. Raise it to prefer existing roles (less to govern); lower it to prefer minimal custom roles (genuinely least privilege). Both are defensible."/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="How expiry actually works" FontSize="15" FontWeight="SemiBold"
+                                           Foreground="{StaticResource Steel}"/>
+                                <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Text="Worth understanding before you approve anything — the differences are not cosmetic."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="ENTRA DIRECTORY ROLES use PIM schedule requests. Entra removes the access on schedule even if this machine is never switched on again. The strongest option, and the only one that is truly self-cleaning."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="INTUNE, WINDOWS 365 AND DEFENDER have no PIM. They also assign roles to GROUPS, not to users. PIM-for-Groups keeps expiry server-side; direct membership does not expire at all and depends on Housekeeping being run."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="ADMINISTRATIVE UNITS narrow a directory role to a slice of the directory. This is how &quot;only for Sales&quot; is genuinely achieved — not by choosing a different permission."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="PERMANENT GRANTS are allowed, shown in red, and recorded as PERMANENT. Nothing will remove them. Use them deliberately, not by accident."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="HOUSEKEEPING NEVER DELETES ON ITS OWN. Scanning is read-only: it lists what has expired and you tick what to remove. That means time-bounding outside PIM is only as reliable as your habit of running it."/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="Strategies that make this work" FontSize="15" FontWeight="SemiBold"
+                                           Foreground="{StaticResource Steel}"/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="PREFER JOINING A GROUP OVER MINTING A ROLE. After a group sync, New Request tells you when an existing group already grants what is needed. Every new role is another object to govern, review and eventually clean up."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="MOVE OFF DIRECT ASSIGNMENT. If the Groups tab reports that every role-holder is a user rather than a group, that is a finding in itself: direct assignments must be granted and revoked one at a time, and they do not appear in group-based access reviews."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="REVIEW BEFORE YOU GRANT. Access Review on the requester often shows they already hold what they are asking for, through a group they forgot about. It also shows what they hold that nobody can justify."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="USE ELIGIBLE, NOT ACTIVE, FOR ANYTHING PRIVILEGED. An eligible assignment means they activate it when they need it, with a record each time. Standing access is the thing every assessor asks about."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="SCOPE BEFORE YOU NARROW PERMISSIONS. An administrative unit often achieves more than an hour spent trimming an action list, because it limits WHO the role can touch rather than what it can do."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="THE HISTORY IS THE EVIDENCE. Every analysis is recorded whether or not it was approved, including what the AI proposed and what the validator rejected. &quot;What was considered and turned down&quot; is a question you will eventually be asked."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="RE-SYNC AFTER TENANT CHANGES. The catalog is a snapshot. If someone creates a role in a portal, this app cannot see it until you sync — and a stale catalog is the one failure mode that looks like a bug but is not."/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel>
+                                <TextBlock Text="What it deliberately will not do" FontSize="15"
+                                           FontWeight="SemiBold" Foreground="{StaticResource Warn}"/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="It will not invent a permission. Anything absent from your synced catalog is rejected, even if the model is confident about it."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="It will not guess when it does not know. &quot;No confident match&quot; is a real answer — granting a guess is worse than granting nothing."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="It will not send identity data to the AI endpoint. The prompt-building code physically has no parameter for a username, object id, or tenant id."/>
+                                <TextBlock TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="It will not let the AI decide what gets granted. The model proposes permissions; deterministic code validates them, ranks the roles, and applies every guard."/>
+                            </StackPanel>
+                        </Border>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Settings">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="14" MaxWidth="760">
+                        <TextBlock Style="{StaticResource H1}" Text="Tenant"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="200"/><ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="Cloud" Grid.Row="0" Margin="0,8"/>
+                            <ComboBox x:Name="CloudCombo" Grid.Row="0" Grid.Column="1" Margin="0,4">
+                                <ComboBoxItem Content="Dod"/>
+                                <ComboBoxItem Content="GccHigh"/>
+                                <ComboBoxItem Content="Commercial"/>
+                            </ComboBox>
+                            <TextBlock Text="Tenant ID" Grid.Row="1" Margin="0,8"/>
+                            <TextBox x:Name="TenantBox" Grid.Row="1" Grid.Column="1" Margin="0,4"/>
+                            <TextBlock Text="Client ID (app reg)" Grid.Row="2" Margin="0,8"/>
+                            <TextBox x:Name="ClientBox" Grid.Row="2" Grid.Column="1" Margin="0,4"/>
+                            <TextBlock Text="Max acceptable excess" Grid.Row="3" Margin="0,8"
+                                       ToolTip="If the best built-in role grants more than this many actions beyond the need, a custom role is drafted instead."/>
+                            <TextBox x:Name="ExcessBox" Grid.Row="3" Grid.Column="1" Margin="0,4" Text="5"/>
+                        </Grid>
+
+                        <TextBlock Style="{StaticResource H1}" Text="GenAI endpoint" Margin="0,16,0,8"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="200"/><ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="Provider" Grid.Row="0" Margin="0,8"/>
+                            <ComboBox x:Name="AiProviderCombo" Grid.Row="0" Grid.Column="1" Margin="0,4">
+                                <ComboBoxItem Content="openai-compatible"/>
+                                <ComboBoxItem Content="azure-openai"/>
+                                <ComboBoxItem Content="anthropic"/>
+                            </ComboBox>
+                            <TextBlock Text="Base URL" Grid.Row="1" Margin="0,8"
+                                       ToolTip="OpenAI-compatible: base up to /chat/completions. Azure OpenAI: the resource endpoint (https://YOUR-RESOURCE.openai.azure.com or .us). Anthropic: leave blank for api.anthropic.com."/>
+                            <TextBox x:Name="AiUrlBox" Grid.Row="1" Grid.Column="1" Margin="0,4"/>
+                            <TextBlock Text="Model / deployment" Grid.Row="2" Margin="0,8"
+                                       ToolTip="Model name (e.g. gpt-4o, claude-sonnet-4-6) — for Azure OpenAI this is the DEPLOYMENT name."/>
+                            <TextBox x:Name="AiModelBox" Grid.Row="2" Grid.Column="1" Margin="0,4"/>
+                            <TextBlock Text="Auth header" Grid.Row="3" Margin="0,8"
+                                       ToolTip="OpenAI-compatible only; Azure and Anthropic use their fixed headers automatically."/>
+                            <TextBox x:Name="AiHeaderBox" Grid.Row="3" Grid.Column="1" Margin="0,4" Text="Authorization"/>
+                            <TextBlock Text="API version (Azure)" Grid.Row="4" Margin="0,8"/>
+                            <TextBox x:Name="AiApiVersionBox" Grid.Row="4" Grid.Column="1" Margin="0,4"
+                                     ToolTip="Azure OpenAI api-version query parameter, e.g. 2024-06-01. Ignored by other providers."/>
+                            <TextBlock Text="API key" Grid.Row="5" Margin="0,8"/>
+                            <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,4">
+                                <PasswordBox x:Name="AiKeyBox" Width="340"/>
+                                <Button Content="Store key (DPAPI)" Click="StoreKey_Click" Margin="10,0,0,0"/>
+                                <TextBlock x:Name="KeyStatus" Margin="10,6,0,0" Style="{StaticResource Hint}"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,10,0,0"
+                                   Text="Data boundary: whichever provider is selected receives the function description plus role names and action lists — never identities. For IL5/MED365 work keep this pointed at an authorized endpoint (org gateway or Azure OpenAI Gov); commercial OpenAI/Anthropic endpoints are appropriate for commercial tenants and lab work."/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,18,0,0">
+                            <Button Content="Save settings" Click="SaveSettings_Click"/>
+                            <Button Content="Sign out / re-consent" Click="SignOut_Click" Margin="10,0,0,0"
+                                    ToolTip="Clears the cached sign-in token. Required after granting NEW permissions in Entra — an existing token keeps the scope set it was issued with and will not pick up newly consented permissions on its own."/>
+                            <Button Content="Check permissions…" Click="CheckScopes_Click" Margin="10,0,0,0"
+                                    ToolTip="Signs in and shows exactly which scopes the issued token carries versus what this build requests — the definitive test for a permission problem."/>
+                            <TextBlock x:Name="SettingsStatus" Margin="12,7,0,0" Style="{StaticResource Hint}"/>
+                        </StackPanel>
+
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,18,0,0"
+                                   Text="Sign-in is interactive (MSAL public client, delegated) — every Graph write is attributed to your admin account in the Entra audit log. The GenAI key and sign-in token cache are DPAPI-encrypted per user. Prompts sent to the GenAI endpoint are logged verbatim to prompt-log.txt in the AccessCheck data folder."/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+        </TabControl>
+    </DockPanel>
+</Window>

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AccessCheck</AssemblyName>
+    <RootNamespace>AccessCheck.App</RootNamespace>
+    <ApplicationIcon>..\..\dist\Assets\AccessCheck.ico</ApplicationIcon>
+    <Version>0.28.0</Version>
+    <FileVersion>0.28.0.0</FileVersion>
+    <AssemblyVersion>0.28.0.0</AssemblyVersion>
+    <Product>AccessCheck</Product>
+    <Company>Accelerated Hues Technology Services LLC</Company>
+    <Description>Least-privilege access broker for Microsoft 365 and Azure.</Description>
+    <Copyright>Copyright (c) Accelerated Hues Technology Services LLC</Copyright>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AccessCheck.Core\AccessCheck.Core.csproj" />
+    <ProjectReference Include="..\AccessCheck.Ai\AccessCheck.Ai.csproj" />
+    <ProjectReference Include="..\AccessCheck.Graph\AccessCheck.Graph.csproj" />
+    <ProjectReference Include="..\AccessCheck.PowerShell\AccessCheck.PowerShell.csproj" />
+  </ItemGroup>
+</Project>

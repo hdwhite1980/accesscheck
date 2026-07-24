@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AccessCheck.Cli</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AccessCheck.Core\AccessCheck.Core.csproj" />
+    <ProjectReference Include="..\AccessCheck.Ai\AccessCheck.Ai.csproj" />
+    <ProjectReference Include="..\AccessCheck.Graph\AccessCheck.Graph.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="appsettings.sample.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
