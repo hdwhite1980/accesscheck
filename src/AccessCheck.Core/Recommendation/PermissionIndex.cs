@@ -74,11 +74,37 @@ public sealed class PermissionIndex
         var byName = index.Entries.ToDictionary(e => e.Action, StringComparer.OrdinalIgnoreCase);
         var merged = new List<PermissionEntry>();
 
+        // JOIN ON A CANONICAL FORM, NOT THE RAW STRING. The two sources disagree about
+        // spelling and spacing for the same permission — the catalog carries Microsoft's
+        // "DeviceCompliancePolices" misspelling while resourceOperations spells it
+        // correctly, and resourceOperations names actions like "View reports" with a space.
+        // Exact matching therefore left a whole service description-less, and a candidate
+        // with no description is one the model can only guess about.
+        var byCanonical = new Dictionary<string, string>(StringComparer.Ordinal);
+        var referenceByName = new Dictionary<string, ReferenceStore.ReferenceEntry>(
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var r in reference.Entries)
+        {
+            referenceByName[r.Name] = r;
+            var canonical = ActionNameMatch.Canonical(r.Name);
+            // First writer wins: a later duplicate canonical form is ambiguous, and Resolve
+            // already refuses ambiguity rather than picking.
+            if (canonical.Length > 0 && !byCanonical.ContainsKey(canonical))
+                byCanonical[canonical] = r.Name;
+        }
+
         foreach (var entry in index.Entries)
         {
             // MICROSOFT'S DESCRIPTION WINS. The role-derived one is a fallback only.
             var doc = reference.Entries.FirstOrDefault(r =>
                 r.Name.Equals(entry.Action, StringComparison.OrdinalIgnoreCase));
+
+            if (doc is null)
+            {
+                var resolved = ActionNameMatch.Resolve(entry.Action, byCanonical);
+                if (resolved is not null) referenceByName.TryGetValue(resolved, out doc);
+            }
 
             merged.Add(doc is null || string.IsNullOrWhiteSpace(doc.Description)
                 ? entry with { DescriptionSource = "granting role (no Microsoft description)" }
@@ -192,7 +218,10 @@ public sealed class PermissionIndex
     /// </summary>
     public static bool RequestWantsStateChange(string functionDescription)
     {
-        var text = (functionDescription ?? "").ToLowerInvariant();
+        // NEGATED CLAUSES ARE NOT REQUIREMENTS. "they should not be able to change any
+        // policy, wipe anything" made this return true for a read-only request, which then
+        // stripped every read permission out of the candidate list.
+        var text = RequestNegation.Positive(functionDescription).ToLowerInvariant();
         string[] verbs =
         {
             "create", "add", "provision", "onboard", "register", "new ",
@@ -234,7 +263,10 @@ public sealed class PermissionIndex
         // Build with the reference when we have it, so candidates carry Microsoft's
         // descriptions and reference-only permissions are offered too.
         var index = Build(catalog, reference);
-        var words = functionDescription.ToLowerInvariant()
+        // Keywords come from what the request ASKS FOR, never from what it forbids. A word
+        // that appears only in a prohibition — "or manage anyone's licences" — was scoring
+        // licence permissions to the top of the very list the model chooses from.
+        var words = RequestNegation.Positive(functionDescription).ToLowerInvariant()
             .Split(new[] { ' ', '\t', '\n', '\r', ',', '.', ';', ':', '(', ')', '/', '\\', '-', '"', '\'' },
                    StringSplitOptions.RemoveEmptyEntries)
             .Where(w => w.Length > 2 && !StopWords.Contains(w))
@@ -297,12 +329,24 @@ public sealed class PermissionIndex
     /// nothing matching DeviceConfigurations — so the service, not the wording, finds it.
     /// Order matters: a model weights what it sees first, so service-wide actions go last.
     /// </summary>
+    /// <remarks>
+    /// TAKES THE REFERENCE, and this is not optional. Building from the catalog alone gave
+    /// every candidate a role-derived description, so the prompt showed
+    /// "[no Microsoft description; granted by X]" for permissions the app could describe
+    /// perfectly well — users/disable was offered with no meaning while ReferenceStore held
+    /// "Disable users" the whole time. CandidateActions was threaded with the reference and
+    /// this method was not, and THIS is the path that runs whenever the service is
+    /// identified: the caller replaces the reference-backed list with this one. So the fix
+    /// applied to the fallback path and missed the common one.
+    /// </remarks>
     public static IReadOnlyList<PermissionEntry> PermissionsInProviders(
         IReadOnlyCollection<string> providers, RoleCatalog catalog,
-        string functionDescription, int limitPerProvider = 220)
+        string functionDescription, int limitPerProvider = 220,
+        ReferenceStore? reference = null)
     {
-        var index = Build(catalog);
-        var words = functionDescription.ToLowerInvariant()
+        var index = Build(catalog, reference);
+        // Same rule as CandidateActions: ordering must not be driven by a forbidden word.
+        var words = RequestNegation.Positive(functionDescription).ToLowerInvariant()
             .Split(new[] { ' ', '\t', '\n', '\r', ',', '.', ';', ':', '(', ')', '/', '\\', '-' },
                    StringSplitOptions.RemoveEmptyEntries)
             .Where(w => w.Length > 2)

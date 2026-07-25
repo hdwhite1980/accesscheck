@@ -24,6 +24,53 @@ public sealed record AiSuggestion
     public string? NoMatchExplanation { get; init; }
     /// <summary>How many candidates were put in front of the model.</summary>
     public int CandidatesConsidered { get; init; }
+
+    /// <summary>
+    /// One citation per returned action. An action with no citation was not justified, and
+    /// the validator may reject it on that basis alone.
+    /// </summary>
+    public IReadOnlyList<ActionCitation> Evidence { get; init; } = Array.Empty<ActionCitation>();
+
+    /// <summary>
+    /// The model's documented answer on whether these actions can go in a custom role.
+    ///
+    /// HONOURED ONLY WHEN IT SAYS NO. A restrictive claim is safe to act on: the worst case
+    /// is a built-in role instead of a custom one, which over-grants but cannot fail. A
+    /// permissive claim is not — treating "yes" as proof would let an unverified assertion
+    /// mint a privileged role, which is exactly what three-state eligibility exists to stop.
+    /// null when the model did not answer.
+    /// </summary>
+    public bool? CustomRoleEligible { get; init; }
+
+    /// <summary>
+    /// The built-in role the model found DOCUMENTED as least-privileged for this task.
+    /// Microsoft documents tasks at the role level, not the permission level, so this is
+    /// often the only place the human-readable answer exists.
+    /// </summary>
+    public string? DocumentedRole { get; init; }
+}
+
+/// <summary>
+/// The description the model claims Microsoft gives for an action, and where it got it.
+///
+/// WHY THIS EXISTS. The model's action strings were already checkable — they either exist
+/// in the catalog or they do not. Its REASONING was not: "users/basic/update allows updates
+/// to user information, which typically includes resetting authentication methods" passed
+/// every check the app had, because nothing checked a prose claim. Requiring the model to
+/// quote the description it relied on, and name where that came from, turns the claim into
+/// something the deterministic layer can compare against ReferenceStore.
+/// </summary>
+public sealed record ActionCitation
+{
+    public required string Action { get; init; }
+    /// <summary>The description the model says it relied on, verbatim.</summary>
+    public required string Description { get; init; }
+    /// <summary>A documentation URL, or the literal "candidate list".</summary>
+    public required string Source { get; init; }
+
+    /// <summary>True when the model looked it up rather than reading the supplied list.</summary>
+    public bool FromDocumentation =>
+        Source.StartsWith("http", StringComparison.OrdinalIgnoreCase);
 }
 
 public enum SuggestionConfidence
@@ -140,11 +187,90 @@ public sealed record ValidationOutcome
     public IReadOnlyList<string> CustomRoleRefusedActions { get; init; } = Array.Empty<string>();
 
     /// <summary>
+    /// Required actions whose custom-role eligibility this tenant has not yet proven either
+    /// way. These CAVEAT the custom role; they do not withhold it. Withholding on Unknown
+    /// meant falling back to a built-in role carrying far more privilege than the uncertain
+    /// custom role would have — the rule weighed uncertainty against nothing instead of
+    /// against the alternative that actually gets granted.
+    /// </summary>
+    public IReadOnlyList<string> EligibilityUnproven { get; init; } = Array.Empty<string>();
+
+    /// <summary>
     /// Whether each permission actually performs the requested operation. Existence and
     /// task coverage are different questions and were being reported as one.
     /// </summary>
     public IReadOnlyList<TaskCoverage.Result> TaskCoverage { get; init; }
         = Array.Empty<TaskCoverage.Result>();
+
+    /// <summary>
+    /// Wrong-resource picks the app CORRECTED before role comparison: right operation, wrong
+    /// object, and the catalog held the right one. Reported because a silent substitution is
+    /// not reviewable — the operator must see that the requirement set was changed.
+    /// </summary>
+    public IReadOnlyList<ResourceFamily.Swap> ResourceSubstitutions { get; init; }
+        = Array.Empty<ResourceFamily.Swap>();
+
+    /// <summary>
+    /// Wrong for the requested resource with NO replacement in the catalog, so dropped
+    /// rather than allowed to shape the recommendation.
+    /// </summary>
+    public IReadOnlyList<string> WrongResourceRemoved { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Permissions excluded because the meaning the model quoted is NOT what Microsoft
+    /// publishes — an invented justification for a real permission. The action existed and
+    /// passed every string-level check; only the reasoning was false.
+    /// </summary>
+    public IReadOnlyList<CitationCheck.Result> FabricatedCitations { get; init; }
+        = Array.Empty<CitationCheck.Result>();
+
+    /// <summary>Permissions whose quoted meaning was confirmed against Microsoft's reference.</summary>
+    public IReadOnlyList<CitationCheck.Result> VerifiedCitations { get; init; }
+        = Array.Empty<CitationCheck.Result>();
+
+    /// <summary>
+    /// A built-in role Microsoft documents as least-privileged for this task, FOUND in this
+    /// tenant's catalog. Null when none was named or none matched here.
+    /// </summary>
+    public string? DocumentedRoleName { get; init; }
+
+    /// <summary>True when that role grants every validated action — checked, not trusted.</summary>
+    public bool DocumentedRoleCovers { get; init; }
+
+    /// <summary>
+    /// True when the documented role was actually put top. False when it covers the task but
+    /// a narrower role beat it on risk-weighted excess — documentation says which role is
+    /// INTENDED for a job, not which is smallest, and the second question has a better
+    /// answer already.
+    /// </summary>
+    public bool DocumentedRolePromoted { get; init; }
+
+    /// <summary>
+    /// The named role exists here but does NOT grant what the task needs, so the claim is
+    /// wrong. Reported rather than silently dropped.
+    /// </summary>
+    public bool DocumentedRoleMismatch { get; init; }
+
+    /// <summary>
+    /// Per validated action, the best description available — Microsoft's where synced,
+    /// otherwise the one the model quoted. Lets guards reason about what a permission DOES
+    /// instead of what it is called.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> ActionDescriptions { get; init; }
+        = new Dictionary<string, string>();
+
+    /// <summary>
+    /// The suggester reported, from documentation, that a required action cannot go in a
+    /// custom role — so a built-in role is the route and no custom role was drafted.
+    /// </summary>
+    public bool CustomRoleRuledOutByDocumentation { get; init; }
+
+    /// <summary>
+    /// Kept, but with no quoted meaning behind them — usually because AccessCheck itself
+    /// added the permission (a ResourceFamily substitution) so the model never saw it.
+    /// Worth showing; never grounds for exclusion.
+    /// </summary>
+    public IReadOnlyList<string> UncitedActions { get; init; } = Array.Empty<string>();
 
     /// <summary>Permissions that CANNOT do what was asked — a read action for a delete task.</summary>
     public IReadOnlyList<TaskCoverage.Result> Contradicted =>

@@ -77,16 +77,25 @@ public class ValidatorTests
 
         var outcome = validator.Validate(BuildCatalog(), suggestion, "reset passwords for tickets");
 
-        Assert.False(outcome.CustomRoleRecommended);
+        // RULE CHANGE, 24 Jul: a custom role is offered whenever the best built-in carries
+        // ANY excess. Only a built-in that covers the task with ZERO excess suppresses it —
+        // Helpdesk grants one action beyond the need, so the exact role wins.
+        Assert.True(outcome.CustomRoleRecommended);
         Assert.NotNull(outcome.BestFit);
         Assert.Equal("role-helpdesk", outcome.BestFit!.RoleId);
-        // Helpdesk grants exactly one action beyond the need
-        Assert.Single(outcome.BestFit.ExcessActions);
+
+        // users/standard/read was REQUESTED but is not in the required set: "reset passwords"
+        // is a write task and TaskCoverage excludes a read permission from performing it. It
+        // is therefore excess in whichever role grants it. Asserting a raw count here made
+        // this ranking test brittle to that rule, so it asserts the ranking instead.
         Assert.Contains("microsoft.directory/users/invalidateAllRefreshTokens",
             outcome.BestFit.ExcessActions);
-        // User Administrator must rank below (bigger delta)
+        Assert.DoesNotContain("microsoft.directory/users/password/update",
+            outcome.BestFit.ExcessActions);
+        // User Administrator must rank below (bigger delta) — the point of the test.
         Assert.True(outcome.RankedFits.Count >= 2);
         Assert.Equal("role-useradmin", outcome.RankedFits[1].RoleId);
+        Assert.True(outcome.RankedFits[0].ExcessRiskScore < outcome.RankedFits[1].ExcessRiskScore);
     }
 
     [Fact]
@@ -233,10 +242,17 @@ public class MultiProviderValidatorTests
         var outcomes = validator.ValidateMulti(cat, suggestion, "mailbox and transport");
 
         var exo = Assert.Single(outcomes);
-        // no covering parent exists -> derivation impossible -> no draft, no fits
+
+        // No role covers BOTH cmdlets, so derivation is impossible: it strips entries out of
+        // a parent and cannot add one the parent lacks.
         Assert.False(exo.Outcome.CustomRoleRecommended);
         Assert.Null(exo.Outcome.CustomRole);
-        Assert.Empty(exo.Outcome.RankedFits);
+
+        // PARTIAL fits ARE offered — the best partial beats nothing, and the operator can
+        // take one and handle the remainder separately. What must NOT appear is a full
+        // cover, because none exists.
+        Assert.NotEmpty(exo.Outcome.RankedFits);
+        Assert.All(exo.Outcome.RankedFits, f => Assert.True(f.IsPartial));
     }
 }
 

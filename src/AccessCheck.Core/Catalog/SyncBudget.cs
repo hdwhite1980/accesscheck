@@ -75,15 +75,29 @@ public sealed class PermissionResolver
     private readonly IReadOnlySet<string> _documented;
     private readonly RoleCatalog? _catalog;
 
+    /// <summary>
+    /// The two sources SPELL THE SAME PERMISSION DIFFERENTLY, so membership cannot be an
+    /// exact test. Microsoft's resourceOperations publishes
+    /// Microsoft.Intune_Devicecompliancepolicies_Read while role definitions carry
+    /// Microsoft.Intune_DeviceCompliancePolices_Read — Microsoft's own misspelling — and
+    /// action names like "View reports" contain a space the catalog form does not.
+    ///
+    /// Exact matching therefore reported permissions Microsoft documents in full as
+    /// "in your tenant only", which is the opposite of the truth and hides the fact that a
+    /// description exists.
+    /// </summary>
+    private readonly Recommendation.ActionNameMatch.NameResolver _documentedNames;
+
     public PermissionResolver(IReadOnlySet<string>? documented, RoleCatalog? catalog)
     {
         _documented = documented ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _catalog = catalog;
+        _documentedNames = new Recommendation.ActionNameMatch.NameResolver(_documented);
     }
 
     public ActionProvenance Resolve(string action)
     {
-        var inDocs = _documented.Contains(action);
+        var inDocs = _documentedNames.Resolve(action) is not null;
         var inTenant = _catalog?.ActionExists(action) ?? false;
 
         if (inDocs && inTenant) return ActionProvenance.TenantVerified;

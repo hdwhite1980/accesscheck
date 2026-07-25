@@ -35,12 +35,26 @@ public sealed class RecommendationValidator
         AiSuggestion suggestion,
         string functionDescription)
     {
+        // RIGHT OPERATION, WRONG RESOURCE — CORRECTED HERE, BEFORE ANYTHING IS PARTITIONED.
+        //
+        // This ran only at render time, so a permission the app had already identified as
+        // acting on the wrong resource still entered the requirement set, still drove role
+        // selection, and still produced "covers part only" against a requirement nothing
+        // could satisfy. Detecting it and then ranking against it anyway is not a guard.
+        //
+        // It must happen HERE rather than inside Validate(): Validate runs per provider, and
+        // a resource family owned by one service reads as uncovered from inside another
+        // service's slice — the Intune verdict would report that the wipe permission does
+        // not revoke sessions, which is true and useless.
+        var correction = ResourceFamily.Correct(
+            functionDescription, suggestion.RequiredActions, catalog.AllActions);
+
         // Global known/unknown split first
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var unknown = new List<string>();
         var byProvider = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var raw in suggestion.RequiredActions)
+        foreach (var raw in correction.Actions)
         {
             var action = raw.Trim();
             if (action.Length == 0 || !seen.Add(action)) continue;
@@ -61,7 +75,13 @@ public sealed class RecommendationValidator
             {
                 RequiredActions = actions,
                 RecommendedRoleId = suggestion.RecommendedRoleId,
-                Reasoning = suggestion.Reasoning
+                Reasoning = suggestion.Reasoning,
+                // Citations must survive the split, or the per-provider validator has
+                // nothing to check the model's quoted meanings against.
+                Evidence = suggestion.Evidence,
+                DocumentedRole = suggestion.DocumentedRole,
+                CustomRoleEligible = suggestion.CustomRoleEligible,
+                Confidence = suggestion.Confidence
             }, functionDescription);
 
             // Custom-role capability differs per provider:
@@ -73,8 +93,19 @@ public sealed class RecommendationValidator
             {
                 if (RbacProviders.DerivedRoleCapable.Contains(provider))
                 {
+                    // THE PARENT MUST COVER THE TASK. Derivation copies a parent and strips
+                    // entries OUT of it, so a parent missing an action can never produce a
+                    // role that has it. RankFits returns PARTIAL covers as well as full ones
+                    // — deliberately, since the best partial beats nothing — so BestFit is
+                    // often a role that grants only some of what was asked.
+                    //
+                    // This used to be unreachable: Exchange cmdlets are never proven
+                    // custom-role eligible, so Unknown eligibility blocked the whole branch.
+                    // Removing that block (Unknown no longer withholds a custom role) made
+                    // the path live, and it would have offered "derive from Mail Recipients"
+                    // for a request Mail Recipients cannot satisfy.
                     var parent = outcome.BestFit;
-                    outcome = parent is null
+                    outcome = parent is null || parent.IsPartial
                         ? outcome with { CustomRoleRecommended = false, CustomRole = null }
                         : outcome with
                         {
@@ -97,6 +128,15 @@ public sealed class RecommendationValidator
                 {
                     UnknownActionsRejected =
                         outcome.UnknownActionsRejected.Concat(unknown).ToList()
+                };
+
+            // Corrections are a property of the REQUEST, not of any one service, so they
+            // ride on the first outcome and are shown once above the verdicts.
+            if (first && correction.Changed)
+                outcome = outcome with
+                {
+                    ResourceSubstitutions = correction.Substituted,
+                    WrongResourceRemoved = correction.Removed
                 };
             first = false;
 
@@ -143,6 +183,10 @@ public sealed class RecommendationValidator
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var referenceOnly = new List<string>();
+        var rejectedForCoverage = new List<TaskCoverage.Result>();
+        var rejectedCitations = new List<CitationCheck.Result>();
+        var verifiedCitations = new List<CitationCheck.Result>();
+        var uncited = new List<string>();
         var provenance = new Dictionary<string, ActionProvenance>(StringComparer.OrdinalIgnoreCase);
         var resolver = new PermissionResolver(ReferenceActions, catalog);
 
@@ -156,6 +200,47 @@ public sealed class RecommendationValidator
             // and the operator needs to know which one is missing.
             var where = resolver.Resolve(action);
             provenance[action] = where;
+
+            // TASK COVERAGE DECIDES ADMISSION, NOT JUST DISPLAY.
+            // "A permission should not move to role comparison unless its documented
+            // description supports the requested operation." Adding it to `valid` and then
+            // flagging it meant it still drove role selection, still shaped the excess
+            // calculation, and still appeared as a recommendation.
+            var coverage = TaskCoverage.Evaluate(
+                functionDescription, action, DescriptionFor(catalog, action));
+
+            if (coverage.Status == TaskCoverage.Status.Contradicted)
+            {
+                rejectedForCoverage.Add(coverage);
+                continue;
+            }
+
+            // DID THE MODEL TELL THE TRUTH ABOUT WHAT MICROSOFT SAYS?
+            //
+            // Every other guard checks the action STRING, which is cheap to verify. Nothing
+            // checked the JUSTIFICATION, so "users/basic/update ... typically includes
+            // resetting authentication methods" passed everything: real action, documented,
+            // present, a write, custom-role eligible. Only the sentence was invented.
+            // A permission whose cited meaning is not Microsoft's does not get to justify a
+            // grant, so it is excluded here rather than displayed and believed.
+            var citation = suggestion.Evidence
+                .FirstOrDefault(c => string.Equals(c.Action, action, StringComparison.OrdinalIgnoreCase));
+            var cited = CitationCheck.Evaluate(
+                action, citation, DescriptionFor(catalog, action),
+                enforce: suggestion.Evidence.Count > 0);
+
+            // ONLY A FABRICATION IS DISQUALIFYING. An action can be uncited for reasons
+            // that are nobody's fault: ResourceFamily SUBSTITUTES the correct permission,
+            // and the model never saw it to cite it. Rejecting on Uncited meant this guard
+            // deleted the corrections made by the guard before it, and a real run came back
+            // with zero validated actions and "nothing actionable for this service".
+            if (cited.Status == CitationCheck.Status.Fabricated)
+            {
+                rejectedCitations.Add(cited);
+                continue;
+            }
+            if (cited.Status == CitationCheck.Status.Uncited) uncited.Add(action);
+            if (cited.Status == CitationCheck.Status.Verified) verifiedCitations.Add(cited);
 
             if (where == ActionProvenance.TenantVerified || where == ActionProvenance.TenantOnly)
             {
@@ -182,6 +267,80 @@ public sealed class RecommendationValidator
 
         var fits = RankFits(catalog, valid);
 
+        // THE ROLE MICROSOFT DOCUMENTS FOR THIS TASK, verified against the catalog rather
+        // than taken on trust. Excess arithmetic answers "which role grants least beyond
+        // what is needed"; it cannot answer "which role is Microsoft's intended answer for
+        // this job", because that judgement includes things the action list does not encode
+        // — Authentication Administrator is documented as unable to act on administrators
+        // or members of role-assignable groups, and no count of excess actions expresses
+        // that. So when the suggester names a role, we CHECK it: does it exist here, and
+        // does it grant everything required? Only then is it preferred.
+        string? documentedRoleName = null;
+        var documentedRoleCovers = false;
+        var documentedRoleMismatch = false;
+        var documentedRolePromoted = false;
+
+        if (!string.IsNullOrWhiteSpace(suggestion.DocumentedRole))
+        {
+            var wanted = suggestion.DocumentedRole!.Trim();
+            var match = catalog.Roles.FirstOrDefault(r =>
+                !RoleCatalog.IsSynthetic(r.Id) &&
+                string.Equals(r.DisplayName, wanted, StringComparison.OrdinalIgnoreCase));
+
+            // Not found is NOT reported: Validate runs per provider, so a directory role
+            // name is legitimately absent from the Intune slice. Silence beats a false
+            // "that role does not exist".
+            if (match is not null)
+            {
+                documentedRoleName = match.DisplayName;
+                documentedRoleCovers = valid.Count > 0
+                    && ActionCoverage.CoversAll(match.AllowedResourceActions, valid);
+
+                // Named as the answer but does not grant what is needed — the claim is
+                // wrong, and saying so is worth more than quietly ignoring it.
+                //
+                // NOT when nothing survived validation, though: with an empty required set
+                // every role "fails to cover", and the card then blamed the model for a
+                // cascade that started somewhere else entirely.
+                // NOT WHEN NO SINGLE ROLE CAN COVER IT. For search-and-purge the answer is a
+                // role GROUP carrying two roles, so 'Search And Purge' correctly grants only
+                // half — and the card called the model's answer unreliable for naming one of
+                // the two roles the plan itself then used. Where a RoleGroupPlan exists, a
+                // partial single role is the expected shape, not a wrong claim.
+                documentedRoleMismatch = valid.Count > 0 && !documentedRoleCovers;
+
+                if (documentedRoleCovers)
+                {
+                    var idx = fits.FindIndex(fit =>
+                        string.Equals(fit.RoleId, match.Id, StringComparison.OrdinalIgnoreCase));
+
+                    // A TIE-BREAKER, NOT AN OVERRIDE.
+                    //
+                    // Promoting unconditionally put Authentication Administrator top for a
+                    // password reset — 18 excess actions including users/delete and the whole
+                    // authenticationMethods family — while Password Administrator sat below it
+                    // carrying almost nothing. The documented role is evidence about INTENT,
+                    // which excess arithmetic cannot supply; it is not evidence that the role
+                    // is narrow, which excess arithmetic measures directly and better.
+                    //
+                    // So it wins ties and near-ties, and loses to a materially narrower role.
+                    // Either way the operator is told which is which.
+                    if (idx > 0
+                        && fits[idx].ExcessRiskScore <= fits[0].ExcessRiskScore)
+                    {
+                        var promoted = fits[idx];
+                        fits.RemoveAt(idx);
+                        fits.Insert(0, promoted);
+                        documentedRolePromoted = true;
+                    }
+                    else if (idx == 0)
+                    {
+                        documentedRolePromoted = true;
+                    }
+                }
+            }
+        }
+
         // Never DRAFT a custom role for a service that cannot create one. Purview has no
         // New-ManagementRole, so proposing a derivation there is proposing something that
         // fails at execution — the plan must be role-group composition instead.
@@ -200,11 +359,25 @@ public sealed class RecommendationValidator
         // THREE STATES, not two. "Not on the refused list" is not proof of eligibility —
         // only a prior tenant acceptance is. Recommending a custom role on Unknown is how
         // a grant reaches approval and then fails at Microsoft, leaving a real role behind.
-        var blockedByEligibility = Ineligibility is null
+        //
+        // RULE CHANGE, 24 Jul, DELIBERATELY OVERRIDING root cause 4 of the original bug
+        // report: a custom role is withheld for exactly two reasons — Microsoft has REFUSED
+        // a required action, or a built-in role already covers the task with NO excess.
+        // UNKNOWN NO LONGER BLOCKS. Blocking on Unknown weighed an uncertain custom role
+        // against nothing, when the real alternative was a built-in role carrying 94 excess
+        // actions, 58 of them escalation-capable. A refused creation leaves nothing behind
+        // once GrantLedger reads it back; a built-in grant leaves every action it carries.
+        var refusedByMicrosoft = Ineligibility is null
             ? new List<string>()
-            : valid.Where(a => Ineligibility.Eligibility(a) != CustomRoleEligibility.Status.Supported)
+            : valid.Where(a => Ineligibility.Eligibility(a) == CustomRoleEligibility.Status.Unsupported)
                    .ToList();
-        var hasIneligible = blockedByEligibility.Count > 0;
+
+        // CAVEATS the custom role rather than withholding it. The operator is told the
+        // tenant has not yet proven these, and approving one proves it for next time.
+        var eligibilityUnproven = Ineligibility is null
+            ? new List<string>()
+            : valid.Where(a => Ineligibility.Eligibility(a) == CustomRoleEligibility.Status.Unknown)
+                   .ToList();
 
         // DECIDE ON RISK, NOT RAW COUNT. Ranking already scores risk-weighted excess and
         // the threshold then threw it away: five extra DELETE actions passed while six
@@ -220,10 +393,32 @@ public sealed class RecommendationValidator
         // can still contain real permission strings and pass every existence check — so it
         // must not silently become a NEW PRIVILEGED ROLE. A built-in role is reviewable;
         // a freshly minted custom role from an uncertain reading is not.
+        // NOTE: confidence NO LONGER GATES the custom role. Under the rule above the only
+        // grounds for withholding it are a refusal and a zero-excess built-in. Confidence
+        // is still carried on the outcome so the card can caveat it, and approval remains
+        // a human step. Restore `&& suggestion.Confidence == SuggestionConfidence.High`
+        // here to put the old enforcement boundary back.
         var confidentEnough = suggestion.Confidence == SuggestionConfidence.High;
+        _ = confidentEnough;
 
-        bool customNeeded = valid.Count > 0 && serviceCanCreateCustomRoles && !hasIneligible &&
-            confidentEnough && (best is null || excessTooRisky);
+        // THE ONLY BUILT-IN ROLE THAT CANNOT BE IMPROVED ON is one that covers the whole
+        // task and grants nothing beyond it. Any excess at all means an exact custom role
+        // is strictly narrower, so it gets offered and the operator decides — the old
+        // threshold silently accepted 94 excess actions because none tripped its limits.
+        var builtInIsExact = best is not null && !best.IsPartial && best.ExcessCount == 0;
+
+        // THE MODEL LOOKED IT UP AND SAID NO. Honour that, because it can only ever REDUCE
+        // privilege: the fallback is a built-in role, which over-grants but works. A "yes"
+        // is deliberately NOT honoured — an unverified assertion must not mint a privileged
+        // role. On a real run the model reported "this action is not eligible for custom
+        // roles", correctly, and the app proposed one anyway because nothing read the field.
+        var modelSaysIneligible = suggestion.CustomRoleEligible == false;
+
+        bool customNeeded = valid.Count > 0
+                            && serviceCanCreateCustomRoles
+                            && refusedByMicrosoft.Count == 0
+                            && !modelSaysIneligible
+                            && !builtInIsExact;
 
         CustomRoleDraft? draft = customNeeded
             ? new CustomRoleDraft
@@ -252,17 +447,55 @@ public sealed class RecommendationValidator
                     .Replace("AC - ", ""), 80));
         }
 
+        // A PARTIAL SINGLE ROLE IS THE EXPECTED SHAPE WHEN A GROUP PLAN EXISTS. For
+        // search-and-purge the answer is a role GROUP carrying two roles, so 'Search And
+        // Purge' correctly grants only half — and the card called the model's answer
+        // unreliable for naming one of the two roles the plan then used. Suppressed here
+        // rather than at the check itself, because the plan is not built until now.
+        if (groupPlan is not null) documentedRoleMismatch = false;
+
         return new ValidationOutcome
         {
             RoleGroupPlan = groupPlan,
             SuggestionConfidence = suggestion.Confidence,
-            CustomRoleBlockedActions = blockedByEligibility,
+            CustomRoleBlockedActions = refusedByMicrosoft,
+            EligibilityUnproven = eligibilityUnproven,
             CustomRoleRefusedActions = Ineligibility is null
                 ? Array.Empty<string>()
                 : valid.Where(a => Ineligibility.IsIneligible(a)).ToList(),
+            // Evaluated for what SURVIVED, plus the ones excluded for contradicting the
+            // task — the operator needs to see what was dropped and why.
             TaskCoverage = TaskCoverage.EvaluateAll(
                 functionDescription,
-                valid.Select(a => (a, DescriptionFor(catalog, a)))).ToList(),
+                valid.Select(a => (a, DescriptionFor(catalog, a))))
+                .Concat(rejectedForCoverage).ToList(),
+            FabricatedCitations = rejectedCitations,
+            VerifiedCitations = verifiedCitations,
+            UncitedActions = uncited,
+            // Whatever meaning we have per action, so downstream guards can read MEANINGS
+            // rather than names. Microsoft's reference first; the model's quoted description
+            // only as a fallback, which is acceptable here because a description can only
+            // ever SUPPRESS a warning — it authorises nothing.
+            ActionDescriptions = valid.ToDictionary(
+                a => a,
+                a =>
+                {
+                    var fromReference = DescriptionFor(catalog, a);
+                    if (!string.IsNullOrWhiteSpace(fromReference)) return fromReference;
+                    var quoted = suggestion.Evidence.FirstOrDefault(c =>
+                        string.Equals(c.Action, a, StringComparison.OrdinalIgnoreCase));
+                    return quoted is null
+                        || quoted.Description.TrimStart().StartsWith("[no Microsoft description",
+                                                                     StringComparison.OrdinalIgnoreCase)
+                        ? ""
+                        : quoted.Description;
+                },
+                StringComparer.OrdinalIgnoreCase),
+            CustomRoleRuledOutByDocumentation = modelSaysIneligible,
+            DocumentedRoleName = documentedRoleName,
+            DocumentedRoleCovers = documentedRoleCovers,
+            DocumentedRoleMismatch = documentedRoleMismatch,
+            DocumentedRolePromoted = documentedRolePromoted,
             ReferenceOnlyActions = referenceOnly,
             Provenance = provenance,
             ValidActions = valid,
@@ -277,9 +510,21 @@ public sealed class RecommendationValidator
     /// Microsoft's description for an action, when the reference has been synced. Falls
     /// back to empty rather than a role description — a role's text describes the ROLE.
     /// </summary>
-    private string DescriptionFor(RoleCatalog catalog, string action) =>
-        ReferenceDescriptions is not null
-        && ReferenceDescriptions.TryGetValue(action, out var d) ? d : "";
+    /// <summary>
+    /// Microsoft's description for a CATALOG action name. Resolved rather than looked up
+    /// directly: the reference is keyed by Microsoft's resourceOperations spelling, and the
+    /// catalog carries the role-definition spelling, which for Intune differ by a letter.
+    /// An exact lookup returned nothing for a whole service.
+    /// </summary>
+    private string DescriptionFor(RoleCatalog catalog, string action)
+    {
+        if (ReferenceDescriptions is null) return "";
+        _descriptionNames ??= new ActionNameMatch.NameResolver(ReferenceDescriptions.Keys);
+        var key = _descriptionNames.Resolve(action);
+        return key is not null && ReferenceDescriptions.TryGetValue(key, out var d) ? d : "";
+    }
+
+    private ActionNameMatch.NameResolver? _descriptionNames;
 
     /// <summary>Microsoft's descriptions, keyed by action. Supplied by the caller.</summary>
     public IReadOnlyDictionary<string, string>? ReferenceDescriptions { get; set; }
@@ -297,8 +542,14 @@ public sealed class RecommendationValidator
             // could never have been granted.
             if (RoleCatalog.IsSynthetic(role.Id)) continue;
 
-            var granted = new HashSet<string>(role.AllowedResourceActions, StringComparer.OrdinalIgnoreCase);
-            var missing = required.Where(a => !granted.Contains(a)).ToList();
+            // ROLLUP-AWARE. Global Reader's microsoft.directory/allEntities/standard/read
+            // grants every read in the directory without literally containing any of them,
+            // so literal containment reported a role that plainly covers a read-only request
+            // as not covering it. ActionRisk prices rollups as categories, so a role covering
+            // this way still ranks below an exact one.
+            var missing = required
+                .Where(a => !ActionCoverage.CoveredBy(a, role.AllowedResourceActions))
+                .ToList();
 
             // A role covering NONE of what is needed is noise. A role covering SOME is a
             // real option when nothing covers everything — which is common once a request

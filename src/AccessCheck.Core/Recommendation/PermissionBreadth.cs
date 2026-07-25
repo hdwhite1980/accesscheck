@@ -38,6 +38,41 @@ public static class PermissionBreadth
         return slash > 0 ? action[..slash] : action;
     }
 
+    /// <summary>
+    /// A readable name for the NAMESPACE — which is what the breadth of an action is
+    /// measured against, and is not the same as the provider the grant flows through.
+    ///
+    /// microsoft.teams/... lives inside an ENTRA DIRECTORY ROLE, so the provider is
+    /// correctly "directory" while the action's reach is Teams. Naming the provider made
+    /// the card say a Teams permission "grants EVERY task on EVERY entity in Entra ID",
+    /// which is alarming, wrong, and sent me chasing a provider-mapping bug that did not
+    /// exist.
+    /// </summary>
+    private static string NamespaceLabel(string action)
+    {
+        var ns = Namespace(action).ToLowerInvariant();
+        return ns switch
+        {
+            "microsoft.directory" => "the Entra ID directory",
+            "microsoft.teams" => "Microsoft Teams",
+            "microsoft.intune" => "Intune",
+            "microsoft.cloudpc" => "Windows 365",
+            "microsoft.entitlementmanagement" => "Entitlement Management",
+            "microsoft.office365.sharepoint" => "SharePoint",
+            "microsoft.office365.exchange" => "Exchange Online",
+            "microsoft.office365.securitycomplianceCenter" => "Purview / Compliance",
+            "microsoft.backup" => "Microsoft 365 Backup",
+            _ => ns
+        };
+    }
+
+    /// <summary>The resource an action acts on — "microsoft.teams/meetings" -> "meetings".</summary>
+    private static string ResourceLabel(string action)
+    {
+        var parts = action.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length >= 2 ? parts[1] : action;
+    }
+
     public static BreadthLevel Classify(string action)
     {
         var a = action.ToLowerInvariant();
@@ -84,6 +119,20 @@ public static class PermissionBreadth
             if (level != BreadthLevel.ServiceWide) continue;
 
             var provider = catalog.ProviderOf(action) ?? RbacProviders.Directory;
+
+            // The provider is where the grant is MADE; the namespace is what it REACHES.
+            // A microsoft.teams/... action is carried by an ENTRA DIRECTORY ROLE, so it is
+            // correctly filed under Entra while acting on Teams. Saying so on the card stops
+            // that reading as a mislabelling — it read that way to me for two days.
+            var viaDirectoryRole =
+                provider.Equals(RbacProviders.Directory, StringComparison.OrdinalIgnoreCase)
+                && !Namespace(action).Equals("microsoft.directory", StringComparison.OrdinalIgnoreCase);
+
+            var whereGranted = viaDirectoryRole
+                ? " It is carried by an Entra DIRECTORY ROLE, which is why it appears under "
+                  + "Entra ID — the role is a directory object; what it reaches is "
+                  + NamespaceLabel(action) + "."
+                : "";
             // Narrower on the SAME RESOURCE, not merely the same service. Offering
             // microsoft.azure.print/printers/basic/update as the "narrower alternative" to
             // an administrativeUnits grant is noise: it is specific, but it is a different
@@ -120,11 +169,20 @@ public static class PermissionBreadth
                 Action = action,
                 Level = level,
                 SameResource = sameResource,
-                Message =
-                    $"'{action}' grants EVERY task on EVERY entity in " +
-                    $"{RbacProviders.DisplayName(provider)} — the entire service, not a " +
-                    "specific capability. \"Zero excess\" is misleading here: the action " +
-                    "itself is the whole service. Narrower permissions exist.",
+                // TWO DIFFERENT BREADTHS WERE BEING DESCRIBED THE SAME WAY.
+                // allEntities/allTasks really is the whole service; <resource>/allTasks is
+                // every task on ONE resource. Calling the second "every entity" overstates
+                // it, and an operator who checks will stop believing the card.
+                Message = action.Contains("/allEntities/", StringComparison.OrdinalIgnoreCase)
+                    ? $"'{action}' grants EVERY task on EVERY entity in " +
+                      $"{NamespaceLabel(action)} — the entire service, not a specific " +
+                      "capability. \"Zero excess\" is misleading here: the action itself is " +
+                      "the whole service. Narrower permissions exist." + whereGranted
+                    : $"'{action}' grants EVERY task on {ResourceLabel(action)} in " +
+                      $"{NamespaceLabel(action)} — the whole resource, not a specific " +
+                      "capability. \"Zero excess\" is misleading here: the action itself is " +
+                      "everything that can be done to that resource. Narrower permissions exist."
+                      + whereGranted,
                 Examples = narrower
             });
         }

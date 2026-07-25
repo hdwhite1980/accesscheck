@@ -39,6 +39,13 @@ public partial class MainWindow : Window
     private readonly List<OutcomeCard> _cards = new();
     /// <summary>Actions the approver added by hand — merged into validation, audited separately.</summary>
     private readonly List<string> _manualActions = new();
+
+    /// <summary>
+    /// Permissions the operator has explicitly taken OUT of the suggestion. There was an
+    /// add path but no remove path, so a wrongly-chosen permission could be supplemented
+    /// and never withdrawn.
+    /// </summary>
+    private readonly List<string> _removedActions = new();
     /// <summary>Role ids proven not to exist this session — never matched again.</summary>
     private readonly HashSet<string> _staleRoleIdsIgnored =
         new(StringComparer.OrdinalIgnoreCase);
@@ -77,11 +84,24 @@ public partial class MainWindow : Window
         }
         ApplyConfigToUi();
 
+        // THE REFERENCE MUST LOAD FIRST. PermissionIndex takes Microsoft's descriptions from
+        // it, so building the index before the reference exists produced an index with no
+        // real descriptions — and it stayed that way until the next rebuild.
+        _referenceStore = ReferenceStore.Load(ReferencePath);
+        _cmdletCapabilities = CmdletCapabilityStore.Load(CmdletCapabilityPath);
+        _ineligibility = CustomRoleEligibility.Load(IneligibilityPath);
+        ActionRisk.UseAuthoritative(_referenceStore.StatedPrivilege());
+        ActionRisk.UseDescriptions(_referenceStore.Entries
+            .Where(e => !string.IsNullOrWhiteSpace(e.Description))
+            .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase));
+
         if (File.Exists(CatalogPath))
         {
             try
             {
                 _catalog = RoleCatalog.Load(CatalogPath);
+                PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
                 RefreshCatalogGrid();
         RebuildPermissionCatalog();
         RefreshForcedProviderList();
@@ -105,16 +125,6 @@ public partial class MainWindow : Window
         }
 
         RefreshHistoryGrid();
-        // Seed documented Purview roles on LOAD as well as after a sync. Doing it only on
-        // sync meant an existing catalog stayed empty until the next full run — so the
-        // documentation fix appeared not to work at all.
-        if (_catalog is not null) PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
-
-        _referenceStore = ReferenceStore.Load(ReferencePath);
-        _cmdletCapabilities = CmdletCapabilityStore.Load(CmdletCapabilityPath);
-        _ineligibility = CustomRoleEligibility.Load(IneligibilityPath);
-        // Microsoft's stated privilege levels replace the heuristic wherever they exist.
-        ActionRisk.UseAuthoritative(_referenceStore.StatedPrivilege());
         RestoreTutorialState();
         CheckCatalogState();
     }
@@ -1149,14 +1159,18 @@ public partial class MainWindow : Window
                 Status("Asking AI what this function requires...");
                 using var provider = AiProviderFactory.Create(BuildAiConfig(), key);
                 provider.PromptLogger = LogPrompt;
-                suggestion = await provider.SuggestAsync(function, _catalog, SelectedForcedProviders());
+                suggestion = await provider.SuggestAsync(function, _catalog, SelectedForcedProviders(), default, _referenceStore);
             }
 
             var validator = new RecommendationValidator
             {
                 MaxAcceptableExcessActions = _config.MaxAcceptableExcessActions,
                 ReferenceActions = _referenceStore.ActionNames(),
-                Ineligibility = _ineligibility
+                Ineligibility = _ineligibility,
+                ReferenceDescriptions = _referenceStore.Entries
+                    .Where(e => e.Description.Length > 0)
+                    .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase)
             };
             var outcomes = validator.ValidateMulti(_catalog, suggestion, function);
             var requiredActions = outcomes.SelectMany(o => o.Outcome.ValidActions)
@@ -2075,6 +2089,14 @@ public partial class MainWindow : Window
 
             var stated = _referenceStore.StatedPrivilege();
             ActionRisk.UseAuthoritative(stated);
+
+            // Descriptions correct the heuristic where Microsoft states no privilege flag —
+            // which for Intune is EVERY action, so the guess was deciding the whole service.
+            var described = _referenceStore.Entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.Description))
+                .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase);
+            ActionRisk.UseDescriptions(described);
             _lastSyncReport.Add("Risk ratings: " + stated.Count + " action(s) now use Microsoft's "
                 + "stated privilege level instead of this app's inference.");
 
@@ -2310,7 +2332,12 @@ public partial class MainWindow : Window
 
     private void RebuildPermissionCatalog()
     {
-        _permissionCatalog = _catalog is null ? null : PermissionIndex.Build(_catalog);
+        // Microsoft's reference supplies the DESCRIPTIONS and contributes permissions no
+        // local role bundles. Building from roles alone hid exactly the set a custom role
+        // exists to grant, and attached role descriptions to unrelated permissions.
+        _permissionCatalog = _catalog is null
+            ? null
+            : PermissionIndex.Build(_catalog, _referenceStore);
 
         var previous = PermProviderFilter.SelectedItem as string;
         PermProviderFilter.Items.Clear();
@@ -2428,6 +2455,14 @@ public partial class MainWindow : Window
             var graph = GetGraph();
             var sync = new CatalogSync(graph);
             var (catalog, results) = await sync.SyncAllAsync(msg => Status(msg));
+
+            // Richer role metadata from BETA — role-level isPrivileged, allowedPrincipalTypes,
+            // categories, richDescription, and assignmentMode (undocumented but present, and
+            // the most likely carrier of AU-scopability). A separate pass so a beta failure
+            // cannot cost us a working v1.0 catalog.
+            var enrichment = await new RoleMetadataEnricher(graph)
+                .EnrichDirectoryAsync(catalog, msg => Status(msg));
+            _lastSyncReport.Add("Role metadata: " + enrichment.Detail);
             var parts = results.Select(r =>
                 RbacProviders.DisplayName(r.Provider) + ": " +
                 (r.Error is null ? r.RoleCount.ToString() : "FAILED")).ToList();
@@ -2715,13 +2750,14 @@ public partial class MainWindow : Window
                     File.AppendAllText(PromptLogPath,
                         "==== " + DateTimeOffset.UtcNow.ToString("o") + " [" + stage + "] ====\n" +
                         prompt + "\n");
-                suggestion = await provider.SuggestAsync(function, _catalog, SelectedForcedProviders());
+                suggestion = await provider.SuggestAsync(function, _catalog, SelectedForcedProviders(), default, _referenceStore);
                 promptSha = provider.LastPromptSha256;
             }
 
             _lastSuggestion = suggestion;
             _lastPromptSha = promptSha;
             _manualActions.Clear();
+            _removedActions.Clear();
             ReasoningText.Text = "AI reasoning: " + suggestion.Reasoning;
 
             RunValidation();
@@ -2750,6 +2786,8 @@ public partial class MainWindow : Window
 
         var merged = _lastSuggestion.RequiredActions
             .Concat(_manualActions)
+            .Where(a => !_removedActions.Contains(a, StringComparer.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         var effective = _lastSuggestion with { RequiredActions = merged };
 
@@ -2761,7 +2799,11 @@ public partial class MainWindow : Window
             // no role in this tenant bundles it. Without this, valid permissions were
             // rejected as invented purely because the catalog is derived from roles.
             ReferenceActions = _referenceStore.ActionNames(),
-            Ineligibility = _ineligibility
+            Ineligibility = _ineligibility,
+            ReferenceDescriptions = _referenceStore.Entries
+                .Where(e => e.Description.Length > 0)
+                .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase)
         };
         var outcomes = validator.ValidateMulti(_catalog, effective, _lastFunction);
 
@@ -3058,6 +3100,110 @@ public partial class MainWindow : Window
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        // WRONG RESOURCE, evaluated ACROSS EVERY PROVIDER. Run per-provider it asked
+        // "does this slice satisfy the whole request?", so an Entra-owned clause looked
+        // unmet from inside the Intune verdict and vice versa. The request is one thing;
+        // the check belongs here, over `validated`, alongside the other guards.
+        // The operation check passes and the object is still wrong —
+        // users/basic/update is a write, and for "reset MFA methods" it writes display
+        // names. Third occurrence of this shape, so it gets its own guard.
+        var wrongResource = ResourceFamily.Check(
+            _lastFunction,
+            validated,
+            _catalog?.AllActions ?? Array.Empty<string>());
+
+        if (wrongResource.Count > 0)
+        {
+            var stackR = NewGuardCard(
+                "Right operation, wrong resource", (Brush)FindResource("Bad"));
+
+            foreach (var f in wrongResource)
+            {
+                stackR.Children.Add(new TextBlock
+                {
+                    Text = f.Message,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+
+                if (f.Better is null) continue;
+
+                stackR.Children.Add(new TextBlock
+                {
+                    Text = "This one does: " + ActionDisplay.Short(f.Better),
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+
+                // Naming the better candidate is the useful half; applying it should not
+                // require retyping a permission string by hand.
+                var useIt = new Button
+                {
+                    Content = "Use " + ActionDisplay.Short(f.Better) + " instead",
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    Margin = new Thickness(0, 6, 0, 0),
+                    Tag = new[] { f.Action, f.Better }
+                };
+                useIt.Click += SwapPermission_Click;
+                stackR.Children.Add(useIt);
+            }
+        }
+
+
+        // WHAT THE APP CHANGED, shown before any verdict. A correction the operator cannot
+        // see is not reviewable, and this tool's whole claim is that a human approves what
+        // actually gets granted.
+        var corrections = outcomes.SelectMany(o => o.Outcome.ResourceSubstitutions).ToList();
+        var dropped = outcomes.SelectMany(o => o.Outcome.WrongResourceRemoved).ToList();
+
+        if (corrections.Count > 0 || dropped.Count > 0)
+        {
+            var stackC = NewGuardCard(
+                "Corrected before role selection", (Brush)FindResource("Warn"));
+
+            foreach (var sw in corrections)
+            {
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = sw.Wrong.Length == 0
+                        ? "ADDED " + ActionDisplay.Short(sw.Right)
+                        : "REPLACED " + ActionDisplay.Short(sw.Wrong)
+                          + "  with  " + ActionDisplay.Short(sw.Right),
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, 0)
+                });
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = sw.Why,
+                    Style = (Style)FindResource("Hint"),
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 0)
+                });
+            }
+
+            foreach (var d in dropped)
+            {
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = "DROPPED " + ActionDisplay.Short(d)
+                         + " — wrong resource, and no equivalent exists in your catalog.",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, 0)
+                });
+            }
+
+            stackC.Children.Add(new TextBlock
+            {
+                Text = "The roles below were ranked against the CORRECTED set. Use "
+                     + "\"Add permission\" to put anything back if you disagree.",
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0)
+            });
+        }
+
         // 1. Limits no permission can encode.
         var constraints = RequestConstraints.Detect(_lastFunction);
         if (constraints.Count > 0)
@@ -3298,15 +3444,28 @@ public partial class MainWindow : Window
         // 2c. Does the proposal actually DO what was asked? Every other guard looks for
         // too MUCH; none notices too LITTLE. A purge request answered with search-only
         // permissions passes every existing check with zero excess.
-        var coverageGaps = CapabilityCoverage.Gaps(
-            _lastFunction,
-            outcomes.SelectMany(o => o.Outcome.ValidActions)
-                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+        // Pass the MEANING with each action, not just the name — the guard asks what a
+        // permission does, and the name frequently does not say.
+        var describedActions = outcomes
+            .SelectMany(o => o.Outcome.ValidActions.Select(a => (Action: a,
+                Description: o.Outcome.ActionDescriptions.TryGetValue(a, out var d) ? d : "")))
+            .GroupBy(x => x.Action, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.FirstOrDefault(x => x.Description.Length > 0) is var hit
+                         && hit.Action is not null ? hit : g.First())
+            .ToList();
+
+        var coverageGaps = CapabilityCoverage.Gaps(_lastFunction, describedActions);
 
         if (coverageGaps.Count > 0)
         {
+            // Title matches the strength of the evidence. Calling an unverifiable suspicion
+            // "may not do what was asked" reads as a finding, and a card that cries wolf is
+            // a card the operator learns to scroll past.
             var stack = NewGuardCard(
-                "This may not do what was asked", (Brush)FindResource("Warn"));
+                coverageGaps.All(g => g.NamesOnly)
+                    ? "Worth checking — could not be confirmed"
+                    : "This may not do what was asked",
+                (Brush)FindResource("Warn"));
 
             foreach (var gap in coverageGaps)
             {
@@ -3528,12 +3687,147 @@ public partial class MainWindow : Window
             {
                 stack.Children.Add(new TextBlock
                 {
-                    Text = "Verified: " + string.Join("; ", parts) + ".",
+                    // "Verified" used to sit in front of an existence check, which reads as
+                    // "verified that these do the job". They are different claims.
+                    Text = "Permission exists: " + string.Join("; ", parts) + ".",
                     Style = (Style)FindResource("Hint"),
                     TextWrapping = TextWrapping.Wrap,
                     Margin = new Thickness(0, 4, 0, 0)
                 });
             }
+        }
+
+        // FABRICATED JUSTIFICATION. The action was real and passed every string-level
+        // check; the sentence used to justify it was not Microsoft's.
+        if (po.Outcome.FabricatedCitations.Count > 0)
+        {
+            var stackF = NewGuardCard(
+                "Excluded: justification does not match Microsoft's documentation",
+                (Brush)FindResource("Bad"));
+
+            foreach (var c in po.Outcome.FabricatedCitations)
+            {
+                stackF.Children.Add(new TextBlock
+                {
+                    Text = ActionDisplay.Short(c.Action),
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, 0)
+                });
+                stackF.Children.Add(new TextBlock
+                {
+                    Text = "The model said: \"" + c.Claimed + "\"",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(12, 2, 0, 0)
+                });
+                if (c.Actual.Length > 0)
+                {
+                    stackF.Children.Add(new TextBlock
+                    {
+                        Text = "Microsoft says: \"" + c.Actual + "\"",
+                        TextWrapping = TextWrapping.Wrap,
+                        Margin = new Thickness(12, 2, 0, 0)
+                    });
+                }
+            }
+
+            stackF.Children.Add(new TextBlock
+            {
+                Text = "These permissions are real and exist in your tenant — only the reason "
+                     + "given for choosing them was invented. They were EXCLUDED before role "
+                     + "selection and did not influence the recommendation below.",
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0)
+            });
+        }
+
+        // TASK COVERAGE. A permission being real says nothing about whether it performs the
+        // requested operation — a read-only action passes every existence check and cannot
+        // delete anything.
+        var contradicted = po.Outcome.Contradicted;
+        if (contradicted.Count > 0)
+        {
+            var stack2 = NewGuardCard(
+                "Excluded: cannot do what was asked", (Brush)FindResource("Warn"));
+
+            foreach (var c2 in contradicted)
+            {
+                stack2.Children.Add(new TextBlock
+                {
+                    Text = ActionDisplay.Short(c2.Action) + " — " + c2.Reason,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+            }
+
+            stack2.Children.Add(new TextBlock
+            {
+                Text = "These were EXCLUDED before role selection — they are not part of the "
+                     + "recommendation below and did not influence which role was chosen. "
+                     + "A read permission cannot perform a write task, so it never belonged "
+                     + "in the proposal.",
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 0)
+            });
+        }
+
+        // Microsoft's own answer for this task, confirmed against the catalog.
+        if (po.Outcome.DocumentedRoleName is not null && po.Outcome.DocumentedRoleCovers)
+        {
+            var narrower = po.Outcome.RankedFits.Count > 0 ? po.Outcome.RankedFits[0] : null;
+
+            stack.Children.Add(new TextBlock
+            {
+                Text = po.Outcome.DocumentedRolePromoted
+                    ? "Microsoft documents '" + po.Outcome.DocumentedRoleName
+                      + "' as the least-privileged built-in role for this task. It exists in "
+                      + "your catalog and grants every required permission, so it is "
+                      + "recommended below. Task-level documentation accounts for limits the "
+                      + "action list does not — which users a role may act on, and which it "
+                      + "may not."
+                    : "Microsoft documents '" + po.Outcome.DocumentedRoleName
+                      + "' as the built-in role for this task, and it does grant everything "
+                      + "required — but '" + (narrower?.DisplayName ?? "the role below")
+                      + "' carries LESS excess and is recommended instead. Documentation says "
+                      + "which role is INTENDED for a job; it does not say which is smallest. "
+                      + "Prefer the documented one only if it enforces a limit the narrower "
+                      + "role does not — such as which users it may act on. Both are in the "
+                      + "list below.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+        else if (po.Outcome.DocumentedRoleMismatch && po.Outcome.DocumentedRoleName is not null)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "'" + po.Outcome.DocumentedRoleName + "' was named as the documented "
+                     + "role for this task, but it does NOT grant everything the task needs, "
+                     + "so it was not preferred. Treat that claim as unreliable and use the "
+                     + "ranking below.",
+                Foreground = (Brush)FindResource("Bad"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+
+        // The suggester looked it up and reported the action cannot go in a custom role.
+        // Shown because "no custom role offered" with no reason reads like a bug.
+        if (po.Outcome.CustomRoleRuledOutByDocumentation)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "No custom role offered: Microsoft's documentation says a required "
+                     + "permission here cannot be placed in a custom role, so a BUILT-IN role "
+                     + "is the only route. The options below are ranked by how little extra "
+                     + "they carry.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
         }
 
         // Actions Microsoft will not accept in a custom role. Saying so up front stops the
@@ -3542,11 +3836,34 @@ public partial class MainWindow : Window
         {
             stack.Children.Add(new TextBlock
             {
-                Text = "No custom role offered: Microsoft refuses "
-                     + string.Join(", ", po.Outcome.CustomRoleBlockedActions.Select(ActionDisplay.Short))
-                     + " in custom roles. Only a subset of directory actions are eligible, so a "
-                     + "BUILT-IN role is the only route for this — the options below are ranked "
-                     + "by how little extra they carry.",
+                Text = po.Outcome.CustomRoleRefusedActions.Count > 0
+                    ? "No custom role offered: Microsoft REFUSES "
+                      + string.Join(", ", po.Outcome.CustomRoleRefusedActions.Select(ActionDisplay.Short))
+                      + " in custom roles. Only a subset of directory actions are eligible, so a "
+                      + "BUILT-IN role is the only route — the options below are ranked by how "
+                      + "little extra they carry."
+                    // UNPROVEN is not the same as refused, and saying so avoids implying
+                    // Microsoft has ruled when it simply has not been asked.
+                    : "No custom role offered.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+
+        // UNPROVEN ELIGIBILITY IS A CAVEAT, NOT A BLOCK. Withholding the custom role here
+        // fell back to a built-in carrying far more privilege than the uncertain role would
+        // have — uncertainty was being weighed against nothing instead of the alternative.
+        if (po.Outcome.EligibilityUnproven.Count > 0 && po.Outcome.CustomRoleRecommended)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "Custom-role eligibility is UNVERIFIED for "
+                     + string.Join(", ", po.Outcome.EligibilityUnproven.Select(ActionDisplay.Short))
+                     + ". The custom role below is still the narrower option and is offered on "
+                     + "that basis. If Microsoft refuses one of these at creation, the refusal is "
+                     + "recorded, nothing is left behind, and the built-in fallback applies — "
+                     + "approving it either way proves eligibility for next time.",
                 Foreground = (Brush)FindResource("Warn"),
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 6, 0, 2)
@@ -3562,9 +3879,10 @@ public partial class MainWindow : Window
             {
                 Text = po.Outcome.ReferenceOnlyActions.Count
                      + " permission(s) exist in Microsoft's reference but are NOT granted by "
-                     + "any role in your tenant. They are valid — a custom role is the only "
-                     + "way to grant them. If the tenant refuses one, the exact error is "
-                     + "recorded in History.",
+                     + "any role in your synced catalog. Tenant availability and custom-role "
+                     + "eligibility are UNVERIFIED — this may be a sync gap, a preview "
+                     + "permission, or one Microsoft does not allow in a custom role. "
+                     + "Confirm before relying on it; any refusal is recorded in History.",
                 Foreground = (Brush)FindResource("Warn"),
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 6, 0, 2)
@@ -4578,6 +4896,39 @@ public partial class MainWindow : Window
              + "Original error: " + message;
     }
 
+    /// <summary>
+    /// First value that is neither null NOR blank. `??` alone is not enough here: an empty
+    /// string is a perfectly good non-null value and will stop the chain, which is how an
+    /// empty role-group name reached Exchange.
+    /// </summary>
+    /// <summary>
+    /// Replaces a wrongly-chosen permission with the one that matches, then re-validates.
+    /// The guard names the better candidate; this saves retyping it.
+    /// </summary>
+    private void SwapPermission_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button b || b.Tag is not string[] pair || pair.Length != 2) return;
+
+        var (wrong, right) = (pair[0], pair[1]);
+
+        _manualActions.RemoveAll(a => a.Equals(wrong, StringComparison.OrdinalIgnoreCase));
+        if (!_manualActions.Contains(right, StringComparer.OrdinalIgnoreCase))
+            _manualActions.Add(right);
+
+        _removedActions.Add(wrong);
+
+        Status("Swapped " + ActionDisplay.Short(wrong) + " for "
+               + ActionDisplay.Short(right) + " — re-validating.");
+        RunValidation();
+    }
+
+    private static string FirstNonBlank(params string?[] candidates)
+    {
+        foreach (var c in candidates)
+            if (!string.IsNullOrWhiteSpace(c)) return c!;
+        return "";
+    }
+
     private string ExplainGrantFailure(Exception ex)
     {
         var msg = ex.Message;
@@ -4710,6 +5061,24 @@ public partial class MainWindow : Window
         // Creating the Intune role and then failing on Entra left a real role in the tenant
         // with no assignment and an error dialog implying nothing worked. Whatever can be
         // known in advance must be checked in advance.
+        // A permission that cannot perform the requested operation must never reach
+        // execution, however real it is.
+        foreach (var c0 in selected)
+        {
+            var bad0 = c0.Outcome.Contradicted;
+            if (bad0.Count == 0) continue;
+            MessageBox.Show(
+                RbacProviders.DisplayName(c0.Provider) + ": "
+                + string.Join(Environment.NewLine + Environment.NewLine,
+                              bad0.Select(b => ActionDisplay.Short(b.Action) + " — " + b.Reason))
+                + Environment.NewLine + Environment.NewLine
+                + "Nothing was changed. Restate the task, or add the permission that performs "
+                + "the operation, then re-analyze.",
+                "Permission cannot do what was asked",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
         var blocked = new List<string>();
         foreach (var c in selected)
         {
@@ -4841,10 +5210,16 @@ public partial class MainWindow : Window
                         // role name for the single-parent path, or it would build a script that
                         // grants nothing.
                         var chosenPlan = choice as RoleGroupPlan;
-                        var covering = draft?.ParentRoleName
-                            ?? (choice as RoleFit)?.DisplayName
-                            ?? chosenPlan?.Roles.FirstOrDefault()?.RoleName
-                            ?? "";
+
+                        // `??` only falls through on NULL, and ParentRoleName is an empty
+                        // STRING when there is no parent — so the chain stopped there and
+                        // handed an empty name downstream, which Exchange rejected with
+                        // "The property DisplayName can't be empty."
+                        var covering = FirstNonBlank(
+                            draft?.ParentRoleName,
+                            (choice as RoleFit)?.DisplayName,
+                            chosenPlan?.Roles.FirstOrDefault()?.RoleName,
+                            draft?.DisplayName);
     
                         // A plan spanning MORE THAN ONE role cannot be executed as a single
                         // derivation. Search-and-purge needs Compliance Search for the search
@@ -4879,6 +5254,19 @@ public partial class MainWindow : Window
                             continue;
                         }
     
+                        // Record what actually resolved, so a blank one is visible in the
+                        // History row rather than having to be inferred from the service's
+                        // complaint two layers down.
+                        record = record with
+                        {
+                            Notes = (record.Notes ?? "")
+                                + "[names: choice=" + choice.GetType().Name
+                                + "; covering='" + covering
+                                + "'; draft='" + (draft?.DisplayName ?? "-")
+                                + "'; plan=" + (plan is null ? "-" : plan.Roles.Count + " role(s)")
+                                + "] "
+                        };
+
                         var script = multiRole
                             ? psExec.BuildMultiRoleGrantScript(scope, plan!, principalUpn, justification)
                             : psExec.BuildGrantScript(scope, draft, covering, principalUpn, justification);
@@ -5813,8 +6201,12 @@ internal sealed class DemoSuggester : IRecommendationProvider
         string functionDescription,
         RoleCatalog catalog,
         IReadOnlyCollection<string>? forcedProviders = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ReferenceStore? reference = null)
     {
+        // Accepted to satisfy the contract and deliberately IGNORED — see DemoProvider.
+        _ = reference;
+
         var catalogRoles = catalog.Roles;
         var words = functionDescription
             .ToLowerInvariant()

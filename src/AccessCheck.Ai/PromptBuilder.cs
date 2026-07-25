@@ -53,23 +53,56 @@ public static class PromptBuilder
         Choose the MINIMAL set of permissions that lets someone perform that function and
         nothing more.
 
+        LOOK IT UP. DO NOT ANSWER FROM MEMORY.
+
+        If you have a search or browsing tool, use it before choosing, every time:
+        - Search Microsoft's documentation for the TASK, not for a permission name. Tasks
+          are documented at the ROLE level. There is no page naming the permission for
+          "reset MFA methods"; there is a page naming the role that does it.
+        - Open that role's reference page and read BOTH the prose (what it can do, and its
+          explicit "cannot do" list) and the action table, which gives every action WITH
+          Microsoft's own description.
+        - Authoritative sources are learn.microsoft.com and MicrosoftDocs repositories on
+          GitHub. A community forum answer is NOT authoritative. A quoted API error message
+          IS evidence about the API and outranks a forum answer describing the portal.
+          Note the date on anything you rely on, and say so if it may be stale.
+
+        If you have NO search tool, you may rely ONLY on the descriptions supplied in the
+        candidate list below. You may not supply a meaning from memory for a permission
+        whose description is missing.
+
         A PERMISSION'S MEANING COMES ONLY FROM ITS OWN DESCRIPTION.
         - Never infer what a permission does from the name or description of a ROLE that
           contains it. A role holds many unrelated actions; its description explains the
           role's purpose, not each permission inside it.
         - A candidate shown as "[no Microsoft description; granted by X]" has an UNKNOWN
-          meaning. Do not guess it from the role name. Prefer a permission whose own
-          description states what it does.
+          meaning. Do not guess it from the role name.
+        - Names that differ by one segment mean entirely different things:
+              microsoft.directory/users/basic/update
+                "Update basic properties on users"
+              microsoft.directory/users/authenticationMethods/basic/update
+                "Update basic properties of authentication methods for users"
+          Only the second touches authentication methods. Nothing in the first name says
+          otherwise, which is exactly why the description decides and the name does not.
         - Never choose a READ permission for a task that requires create, update, delete,
           reset, revoke, wipe, approve or execute. A read permission cannot perform those
           operations, however closely its name matches the request.
 
-        HOW PERMISSIONS ARE NAMED. This is the part that trips people up. Permissions are
-        named after the RESOURCE they act on, never after the feature or tool that uses
-        that resource. There is no permission called "GPO analytics", "Group Policy
-        analytics", "Endpoint analytics" or "Autopilot" — those are product features. So do
-        not look for the feature's name in the list. Instead work out WHICH RESOURCES the
-        feature reads or changes, then pick the permissions for those resources.
+        DO NOT MAP THE REQUEST'S VERB ONTO AN ACTION'S VERB. What an operation means
+        depends on the object it acts on. Determine the operation from the documented
+        descriptions and the role's prose, not from the word used in the request. If the
+        documentation describes the task as removing and re-registering something, the
+        actions are delete and create even though the request said "reset".
+
+        RETURN THE FULL SET the task needs, not a single action. Most tasks need several.
+        Include a read action only where the documented role carries it alongside the
+        writes for this same task; do not add reads for convenience.
+
+        HOW PERMISSIONS ARE NAMED. Permissions are named after the RESOURCE they act on,
+        never after the feature or tool that uses that resource. There is no permission
+        called "GPO analytics", "Group Policy analytics", "Endpoint analytics" or
+        "Autopilot" — those are product features. Work out WHICH RESOURCES the feature
+        reads or changes, then pick the permissions for those resources.
 
         Worked example: Group Policy analytics in Intune imports GPO exports and compares
         them against configuration profiles and security baselines. Its resources are
@@ -79,6 +112,8 @@ public static class PromptBuilder
 
         Rules that matter:
         - Use ONLY strings that appear verbatim in the candidate list. Never invent one.
+          If documentation names a permission that is absent from the list, say so in your
+          reasoning rather than substituting a similar-looking one.
         - Prefer the NARROWEST permission that does the job. A permission covering all
           entities or all tasks in a service grants that entire service and is almost never
           the least-privilege answer — choose it only if no narrower candidate covers the
@@ -93,13 +128,33 @@ public static class PromptBuilder
           "only for the sales team" — understand that no permission can express it. Choose
           the permissions for the ACTION only, and say in your reasoning that the limit must
           be applied through scope or a restricted built-in role instead.
+        - Custom-role eligibility is a SEPARATE question. Some actions appear in built-in
+          roles and cannot be placed in a custom role. If documentation says an action is
+          unsupported for custom role creation, report it; do not treat silence as a yes.
 
-        Return an empty requiredActions array ONLY if you genuinely cannot work out which
-        resources the feature touches. "No permission mentions this feature by name" is NOT
-        a reason to return empty — permissions never mention features by name.
+        EVERY ACTION YOU RETURN MUST BE CITED. For each one, give the description you are
+        relying on, verbatim, and where it came from: a documentation URL if you looked it
+        up, or the exact string "candidate list" if it came from the list below. An action
+        you cannot cite a description for does NOT go in the set.
 
-        Return ONLY {"requiredActions":["..."],"recommendedRoleId":null,"reasoning":"one
-        short paragraph"}. No prose outside the JSON, no fences.
+        IF YOU CAN COVER PART OF THE TASK, RETURN THAT PART. A request to "unlock accounts
+        and check sign-in logs" where only the sign-in log permission exists should return
+        that permission and say in the reasoning that the other half was not found. Returning
+        nothing because one clause could not be answered discards the half that could — the
+        operator can add the rest, but only if they can see what you did find.
+
+        Return an empty requiredActions array only if you can cover NONE of it, or cannot
+        cite a description for anything that fits. Say what you searched. "No permission mentions this feature by name" is NOT a reason to return
+        empty — permissions never mention features by name.
+
+        Return ONLY this JSON. No prose outside it, no fences:
+        {"requiredActions":["..."],
+         "evidence":[{"action":"...","description":"verbatim description",
+                      "source":"https://learn.microsoft.com/... or candidate list"}],
+         "documentedRole":"least-privileged built-in role for this task, or null",
+         "customRoleEligible":true,
+         "recommendedRoleId":null,
+         "reasoning":"one short paragraph"}
         """;
 
     public static string BuildServiceUser(string function, IReadOnlyCollection<string> providers)

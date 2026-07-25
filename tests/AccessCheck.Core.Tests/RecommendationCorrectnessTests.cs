@@ -18,7 +18,9 @@ public class RecommendationCorrectnessTests
     private static RoleCatalog CatalogWith(params RoleDefinitionRecord[] roles)
     {
         var c = new RoleCatalog();
-        c.ReplaceAll(roles);
+        // Fixed timestamp: a test that reads the clock is a test that can differ between
+        // runs, and nothing here depends on the sync time being recent.
+        c.ReplaceAll(roles, new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
         return c;
     }
 
@@ -106,11 +108,40 @@ public class RecommendationCorrectnessTests
             "r1", "Reader", RbacProviders.Directory, "d",
             "microsoft.directory/users/standard/read"));
 
+        // A DESCRIPTION, because without one this tested keyword luck rather than the thing
+        // it names. "user" and "users" are STOPWORDS — they appear in nearly every directory
+        // permission and so discriminate nothing — which left "helpdesk view properties" to
+        // match an action string containing none of those words. The candidate list came
+        // back empty and the assertion failed for a reason unrelated to read-stripping.
+        var reference = new ReferenceStore
+        {
+            Entries =
+            {
+                new ReferenceStore.ReferenceEntry
+                {
+                    Name = "microsoft.directory/users/standard/read",
+                    Provider = RbacProviders.Directory,
+                    Description = "Read standard properties on users."
+                }
+            }
+        };
+
         var candidates = PermissionIndex.CandidateActions(
-            "let the helpdesk view user properties", catalog);
+            "let the helpdesk view user properties", catalog, reference: reference);
 
         Assert.Contains(candidates,
             c => c.Action.Contains("/read", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ReadTaskDoesNotTriggerTheWriteFilterAtAll()
+    {
+        // The property the test above was really reaching for, asserted directly rather
+        // than through keyword scoring.
+        Assert.False(PermissionIndex.RequestWantsStateChange(
+            "let the helpdesk view user properties"));
+        Assert.True(PermissionIndex.RequestWantsStateChange(
+            "let the helpdesk reset MFA methods"));
     }
 
     [Fact]

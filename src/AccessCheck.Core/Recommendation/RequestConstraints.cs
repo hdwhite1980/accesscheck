@@ -57,6 +57,17 @@ public static class RequestConstraints
         "not be able to edit", "not be able to modify", "look but not"
     };
 
+    /// <summary>
+    /// True when the matched restriction is scoped to the GRANTEE — "their own team", "their
+    /// department" — rather than to a fixed set of objects. Only then is the dynamic-AU
+    /// explanation relevant.
+    /// </summary>
+    private static bool PerPersonScope(string phrase) =>
+        phrase.Contains("own", StringComparison.Ordinal)
+        || phrase.Contains("their", StringComparison.Ordinal)
+        || phrase.Contains("they ", StringComparison.Ordinal)
+        || phrase.Contains("assigned to them", StringComparison.Ordinal);
+
     public static IReadOnlyList<Finding> Detect(string functionDescription)
     {
         var text = functionDescription.ToLowerInvariant();
@@ -99,11 +110,17 @@ public static class RequestConstraints
                     "tenant-wide (the Directory scope control on the approve panel).\n" +
                     "* Intune — SCOPE TAGS on the role assignment.\n" +
                     "* Azure resources — assign at the resource group or resource, not the " +
-                    "subscription.\n\n" +
-                    "\"Their own team\" specifically usually means a DYNAMIC administrative unit " +
-                    "whose membership rule matches the manager's department, or one AU per team. " +
-                    "It is per-person scope, so one tenant-wide grant cannot express it however " +
-                    "the permissions are chosen."
+                    "subscription." +
+                    // Only say this when the request actually expressed a PER-PERSON scope.
+                    // It was printed for every restriction, including "assign them to
+                    // themselves", so the card explained "their own team" to operators who
+                    // had not said anything of the kind.
+                    (PerPersonScope(restriction)
+                        ? "\n\n\"Their own team\" specifically usually means a DYNAMIC " +
+                          "administrative unit whose membership rule matches the manager's " +
+                          "department, or one AU per team. It is per-person scope, so one " +
+                          "tenant-wide grant cannot express it however the permissions are chosen."
+                        : "")
             });
         }
 
@@ -291,7 +308,14 @@ public static class NonRbacCapability
          "approver. Granting entitlement management permissions instead would let them " +
          "ADMINISTER packages — far more than approving requests for their own team."),
 
-        (new[] { "access review", "review campaign", "certify access" },
+        // INTENT, NOT CONTEXT. Bare "access review" fired on "read every group and its
+        // membership FOR the quarterly access review" — where the review is the reason for
+        // the request, not the thing being asked for. Markers now require someone to be
+        // doing the reviewing.
+        (new[] { "be a reviewer", "be reviewers", "as a reviewer", "reviewer on",
+                 "run an access review", "run access reviews", "running access reviews",
+                 "perform an access review", "certify access", "attest to access",
+                 "recertify access", "review campaign" },
          "Running an access review", "the access review definition",
          "Reviewers are named in the ACCESS REVIEW DEFINITION itself. An RBAC permission grants " +
          "the ability to CREATE and manage reviews, which is broader than being a reviewer on one."),
@@ -304,7 +328,29 @@ public static class NonRbacCapability
 
         (new[] { "self-service password reset", "sspr", "reset their own password" },
          "Self-service password reset", "the SSPR policy",
-         "SSPR is enabled by policy for a group of users; it is not an admin permission.")
+         "SSPR is enabled by policy for a group of users; it is not an admin permission."),
+
+        (new[] { "create a sharepoint site", "create sharepoint sites", "own sharepoint sites",
+                 "spin up their own site", "spin up their own sharepoint", "create a team site",
+                 "create a communication site", "provision a site", "provision sites",
+                 "create teams for", "create a team", "create their own teams" },
+         "Creating a SharePoint site or Team", "the group-creation policy, not a permission",
+         "NO SharePoint permission grants this. Three different mechanisms produce a site, " +
+         "ranked here narrowest first.\n\n" +
+         "1. GROUP-CONNECTED TEAM SITE — creating a Microsoft 365 group creates a site, and a " +
+         "Team is backed by one. Who may create groups is the Group.Unified DIRECTORY SETTING: " +
+         "EnableGroupCreation, plus GroupCreationAllowedGroupId naming a security group. THE " +
+         "GRANT IS MEMBERSHIP OF THAT GROUP, which AccessCheck can make time-bound through PIM " +
+         "for Groups. If EnableGroupCreation is still true tenant-wide, everyone can already do " +
+         "this and there is nothing to grant.\n\n" +
+         "2. COMMUNICATION SITE — SharePoint admin centre > Settings > Site creation. An " +
+         "ORG-WIDE toggle, not a per-user grant.\n\n" +
+         "3. ANY SITE AS ADMIN — microsoft.office365.sharePoint/allEntities/allTasks, which is " +
+         "the whole of SharePoint and never the right answer to a site-creation request.\n\n" +
+         "Turning site creation OFF does not stop group creation, and a new group still creates " +
+         "a site — set both levers together or one defeats the other. A role carrying " +
+         "groups.unified/create is BROADER than the group membership: role holders bypass the " +
+         "restriction entirely.")
     };
 
     public static IReadOnlyList<Finding> Findings(string functionDescription)

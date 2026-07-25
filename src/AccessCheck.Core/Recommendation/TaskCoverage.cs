@@ -54,12 +54,25 @@ public static class TaskCoverage
         // told the compiler the parameter might be null and then assigned it straight into
         // a required non-null property — hence CS8601 four times over.
         var safeAction = action ?? "";
-        var text = (functionDescription ?? "").ToLowerInvariant();
+
+        // A CLAUSE FORBIDDING AN OPERATION IS NOT A REQUEST FOR IT. On a read-only request
+        // ending "...they should not be able to change any policy, wipe anything, or touch
+        // a device", the words change and wipe were matched as REQUESTED operations, so two
+        // correct Intune read permissions were both excluded as unable to perform a delete.
+        // The more precisely an operator writes down what a grant must not do, the more this
+        // demanded exactly that. RequestConstraints already reads these clauses correctly as
+        // limits, so one screen was interpreting the same sentence two opposite ways.
+        var text = RequestNegation.Positive(functionDescription).ToLowerInvariant();
         var name = safeAction.ToLowerInvariant();
         var desc = (description ?? "").ToLowerInvariant();
 
+        // WHOLE WORDS, AND NOT DESCRIPTIONS OF EXISTING STATE. A plain Contains matched
+        // "set " inside "re-set" and matched "configured" in "every policy we have
+        // configured" — the second turned an explicitly read-only audit request into an
+        // update request and excluded both correct permissions for being read-only.
+        var padded = " " + new string(text.Select(c => char.IsLetterOrDigit(c) ? c : ' ').ToArray()) + " ";
         var requested = RequestedOperations
-            .Where(o => o.Words.Any(w => text.Contains(w, StringComparison.Ordinal)))
+            .Where(o => o.Words.Any(w => CapabilityCoverage.WordAppears(padded, w)))
             .Select(o => o.Op)
             .ToList();
 

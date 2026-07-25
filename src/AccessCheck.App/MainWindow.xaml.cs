@@ -91,6 +91,10 @@ public partial class MainWindow : Window
         _cmdletCapabilities = CmdletCapabilityStore.Load(CmdletCapabilityPath);
         _ineligibility = CustomRoleEligibility.Load(IneligibilityPath);
         ActionRisk.UseAuthoritative(_referenceStore.StatedPrivilege());
+        ActionRisk.UseDescriptions(_referenceStore.Entries
+            .Where(e => !string.IsNullOrWhiteSpace(e.Description))
+            .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase));
 
         if (File.Exists(CatalogPath))
         {
@@ -2085,6 +2089,14 @@ public partial class MainWindow : Window
 
             var stated = _referenceStore.StatedPrivilege();
             ActionRisk.UseAuthoritative(stated);
+
+            // Descriptions correct the heuristic where Microsoft states no privilege flag —
+            // which for Intune is EVERY action, so the guess was deciding the whole service.
+            var described = _referenceStore.Entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.Description))
+                .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Description, StringComparer.OrdinalIgnoreCase);
+            ActionRisk.UseDescriptions(described);
             _lastSyncReport.Add("Risk ratings: " + stated.Count + " action(s) now use Microsoft's "
                 + "stated privilege level instead of this app's inference.");
 
@@ -3088,6 +3100,110 @@ public partial class MainWindow : Window
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        // WRONG RESOURCE, evaluated ACROSS EVERY PROVIDER. Run per-provider it asked
+        // "does this slice satisfy the whole request?", so an Entra-owned clause looked
+        // unmet from inside the Intune verdict and vice versa. The request is one thing;
+        // the check belongs here, over `validated`, alongside the other guards.
+        // The operation check passes and the object is still wrong —
+        // users/basic/update is a write, and for "reset MFA methods" it writes display
+        // names. Third occurrence of this shape, so it gets its own guard.
+        var wrongResource = ResourceFamily.Check(
+            _lastFunction,
+            validated,
+            _catalog?.AllActions ?? Array.Empty<string>());
+
+        if (wrongResource.Count > 0)
+        {
+            var stackR = NewGuardCard(
+                "Right operation, wrong resource", (Brush)FindResource("Bad"));
+
+            foreach (var f in wrongResource)
+            {
+                stackR.Children.Add(new TextBlock
+                {
+                    Text = f.Message,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+
+                if (f.Better is null) continue;
+
+                stackR.Children.Add(new TextBlock
+                {
+                    Text = "This one does: " + ActionDisplay.Short(f.Better),
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+
+                // Naming the better candidate is the useful half; applying it should not
+                // require retyping a permission string by hand.
+                var useIt = new Button
+                {
+                    Content = "Use " + ActionDisplay.Short(f.Better) + " instead",
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    Margin = new Thickness(0, 6, 0, 0),
+                    Tag = new[] { f.Action, f.Better }
+                };
+                useIt.Click += SwapPermission_Click;
+                stackR.Children.Add(useIt);
+            }
+        }
+
+
+        // WHAT THE APP CHANGED, shown before any verdict. A correction the operator cannot
+        // see is not reviewable, and this tool's whole claim is that a human approves what
+        // actually gets granted.
+        var corrections = outcomes.SelectMany(o => o.Outcome.ResourceSubstitutions).ToList();
+        var dropped = outcomes.SelectMany(o => o.Outcome.WrongResourceRemoved).ToList();
+
+        if (corrections.Count > 0 || dropped.Count > 0)
+        {
+            var stackC = NewGuardCard(
+                "Corrected before role selection", (Brush)FindResource("Warn"));
+
+            foreach (var sw in corrections)
+            {
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = sw.Wrong.Length == 0
+                        ? "ADDED " + ActionDisplay.Short(sw.Right)
+                        : "REPLACED " + ActionDisplay.Short(sw.Wrong)
+                          + "  with  " + ActionDisplay.Short(sw.Right),
+                    FontWeight = FontWeights.SemiBold,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, 0)
+                });
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = sw.Why,
+                    Style = (Style)FindResource("Hint"),
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 0)
+                });
+            }
+
+            foreach (var d in dropped)
+            {
+                stackC.Children.Add(new TextBlock
+                {
+                    Text = "DROPPED " + ActionDisplay.Short(d)
+                         + " — wrong resource, and no equivalent exists in your catalog.",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, 0)
+                });
+            }
+
+            stackC.Children.Add(new TextBlock
+            {
+                Text = "The roles below were ranked against the CORRECTED set. Use "
+                     + "\"Add permission\" to put anything back if you disagree.",
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0)
+            });
+        }
+
         // 1. Limits no permission can encode.
         var constraints = RequestConstraints.Detect(_lastFunction);
         if (constraints.Count > 0)
@@ -3328,15 +3444,28 @@ public partial class MainWindow : Window
         // 2c. Does the proposal actually DO what was asked? Every other guard looks for
         // too MUCH; none notices too LITTLE. A purge request answered with search-only
         // permissions passes every existing check with zero excess.
-        var coverageGaps = CapabilityCoverage.Gaps(
-            _lastFunction,
-            outcomes.SelectMany(o => o.Outcome.ValidActions)
-                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+        // Pass the MEANING with each action, not just the name — the guard asks what a
+        // permission does, and the name frequently does not say.
+        var describedActions = outcomes
+            .SelectMany(o => o.Outcome.ValidActions.Select(a => (Action: a,
+                Description: o.Outcome.ActionDescriptions.TryGetValue(a, out var d) ? d : "")))
+            .GroupBy(x => x.Action, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.FirstOrDefault(x => x.Description.Length > 0) is var hit
+                         && hit.Action is not null ? hit : g.First())
+            .ToList();
+
+        var coverageGaps = CapabilityCoverage.Gaps(_lastFunction, describedActions);
 
         if (coverageGaps.Count > 0)
         {
+            // Title matches the strength of the evidence. Calling an unverifiable suspicion
+            // "may not do what was asked" reads as a finding, and a card that cries wolf is
+            // a card the operator learns to scroll past.
             var stack = NewGuardCard(
-                "This may not do what was asked", (Brush)FindResource("Warn"));
+                coverageGaps.All(g => g.NamesOnly)
+                    ? "Worth checking — could not be confirmed"
+                    : "This may not do what was asked",
+                (Brush)FindResource("Warn"));
 
             foreach (var gap in coverageGaps)
             {
@@ -3568,50 +3697,49 @@ public partial class MainWindow : Window
             }
         }
 
-        // WRONG RESOURCE. The operation check passes and the object is still wrong —
-        // users/basic/update is a write, and for "reset MFA methods" it writes display
-        // names. Third occurrence of this shape, so it gets its own guard.
-        var wrongResource = ResourceFamily.Check(
-            _lastFunction,
-            po.Outcome.ValidActions,
-            _catalog?.AllActions ?? Array.Empty<string>());
-
-        if (wrongResource.Count > 0)
+        // FABRICATED JUSTIFICATION. The action was real and passed every string-level
+        // check; the sentence used to justify it was not Microsoft's.
+        if (po.Outcome.FabricatedCitations.Count > 0)
         {
-            var stackR = NewGuardCard(
-                "Right operation, wrong resource", (Brush)FindResource("Bad"));
+            var stackF = NewGuardCard(
+                "Excluded: justification does not match Microsoft's documentation",
+                (Brush)FindResource("Bad"));
 
-            foreach (var f in wrongResource)
+            foreach (var c in po.Outcome.FabricatedCitations)
             {
-                stackR.Children.Add(new TextBlock
+                stackF.Children.Add(new TextBlock
                 {
-                    Text = f.Message,
-                    TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 4, 0, 0)
-                });
-
-                if (f.Better is null) continue;
-
-                stackR.Children.Add(new TextBlock
-                {
-                    Text = "This one does: " + ActionDisplay.Short(f.Better),
+                    Text = ActionDisplay.Short(c.Action),
                     FontWeight = FontWeights.SemiBold,
                     TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 4, 0, 0)
+                    Margin = new Thickness(0, 6, 0, 0)
                 });
-
-                // Naming the better candidate is the useful half; applying it should not
-                // require retyping a permission string by hand.
-                var useIt = new Button
+                stackF.Children.Add(new TextBlock
                 {
-                    Content = "Use " + ActionDisplay.Short(f.Better) + " instead",
-                    HorizontalAlignment = HorizontalAlignment.Left,
-                    Margin = new Thickness(0, 6, 0, 0),
-                    Tag = new[] { f.Action, f.Better }
-                };
-                useIt.Click += SwapPermission_Click;
-                stackR.Children.Add(useIt);
+                    Text = "The model said: \"" + c.Claimed + "\"",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(12, 2, 0, 0)
+                });
+                if (c.Actual.Length > 0)
+                {
+                    stackF.Children.Add(new TextBlock
+                    {
+                        Text = "Microsoft says: \"" + c.Actual + "\"",
+                        TextWrapping = TextWrapping.Wrap,
+                        Margin = new Thickness(12, 2, 0, 0)
+                    });
+                }
             }
+
+            stackF.Children.Add(new TextBlock
+            {
+                Text = "These permissions are real and exist in your tenant — only the reason "
+                     + "given for choosing them was invented. They were EXCLUDED before role "
+                     + "selection and did not influence the recommendation below.",
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0)
+            });
         }
 
         // TASK COVERAGE. A permission being real says nothing about whether it performs the
@@ -3645,6 +3773,70 @@ public partial class MainWindow : Window
             });
         }
 
+        // Microsoft's own answer for this task, confirmed against the catalog.
+        if (po.Outcome.DocumentedRoleName is not null && po.Outcome.DocumentedRoleCovers)
+        {
+            var narrower = po.Outcome.RankedFits.Count > 0 ? po.Outcome.RankedFits[0] : null;
+
+            stack.Children.Add(new TextBlock
+            {
+                Text = po.Outcome.DocumentedRolePromoted
+                    // "Recommended below" was wrong whenever a custom role also won the
+                    // dropdown: the promotion orders the BUILT-IN list, it does not beat a
+                    // custom role. The card said one thing and the selector said another.
+                    ? "Microsoft documents '" + po.Outcome.DocumentedRoleName
+                      + "' as the least-privileged built-in role for this task. It exists in "
+                      + "your catalog and grants every required permission, so it is the "
+                      + "recommended BUILT-IN option below"
+                      + (po.Outcome.CustomRoleRecommended
+                          ? " — though the custom role is narrower still and is selected by "
+                            + "default. Choose the built-in role instead if you would rather "
+                            + "not create anything, or if its documented limits matter."
+                          : ". Task-level documentation accounts for limits the action list "
+                            + "does not — which users a role may act on, and which it may not.")
+                    : "Microsoft documents '" + po.Outcome.DocumentedRoleName
+                      + "' as the built-in role for this task, and it does grant everything "
+                      + "required — but '" + (narrower?.DisplayName ?? "the role below")
+                      + "' carries LESS excess and is recommended instead. Documentation says "
+                      + "which role is INTENDED for a job; it does not say which is smallest. "
+                      + "Prefer the documented one only if it enforces a limit the narrower "
+                      + "role does not — such as which users it may act on. Both are in the "
+                      + "list below.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+        else if (po.Outcome.DocumentedRoleMismatch && po.Outcome.DocumentedRoleName is not null)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "'" + po.Outcome.DocumentedRoleName + "' was named as the documented "
+                     + "role for this task, but it does NOT grant everything the task needs, "
+                     + "so it was not preferred. Treat that claim as unreliable and use the "
+                     + "ranking below.",
+                Foreground = (Brush)FindResource("Bad"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+
+        // The suggester looked it up and reported the action cannot go in a custom role.
+        // Shown because "no custom role offered" with no reason reads like a bug.
+        if (po.Outcome.CustomRoleRuledOutByDocumentation)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "No custom role offered: Microsoft's documentation says a required "
+                     + "permission here cannot be placed in a custom role, so a BUILT-IN role "
+                     + "is the only route. The options below are ranked by how little extra "
+                     + "they carry.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+
         // Actions Microsoft will not accept in a custom role. Saying so up front stops the
         // operator wondering why no custom-role option appeared.
         if (po.Outcome.CustomRoleBlockedActions.Count > 0)
@@ -3659,12 +3851,26 @@ public partial class MainWindow : Window
                       + "little extra they carry."
                     // UNPROVEN is not the same as refused, and saying so avoids implying
                     // Microsoft has ruled when it simply has not been asked.
-                    : "No custom role offered: custom-role eligibility is UNVERIFIED for "
-                      + string.Join(", ", po.Outcome.CustomRoleBlockedActions.Select(ActionDisplay.Short))
-                      + ". Nothing in Microsoft's reference marks which actions are eligible, and "
-                      + "this tenant has not yet accepted these in a custom role — so a custom "
-                      + "role is not recommended automatically. A built-in role below is the safe "
-                      + "route; approving one of those proves eligibility for next time.",
+                    : "No custom role offered.",
+                Foreground = (Brush)FindResource("Warn"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 2)
+            });
+        }
+
+        // UNPROVEN ELIGIBILITY IS A CAVEAT, NOT A BLOCK. Withholding the custom role here
+        // fell back to a built-in carrying far more privilege than the uncertain role would
+        // have — uncertainty was being weighed against nothing instead of the alternative.
+        if (po.Outcome.EligibilityUnproven.Count > 0 && po.Outcome.CustomRoleRecommended)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "Custom-role eligibility is UNVERIFIED for "
+                     + string.Join(", ", po.Outcome.EligibilityUnproven.Select(ActionDisplay.Short))
+                     + ". The custom role below is still the narrower option and is offered on "
+                     + "that basis. If Microsoft refuses one of these at creation, the refusal is "
+                     + "recorded, nothing is left behind, and the built-in fallback applies — "
+                     + "approving it either way proves eligibility for next time.",
                 Foreground = (Brush)FindResource("Warn"),
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 6, 0, 2)

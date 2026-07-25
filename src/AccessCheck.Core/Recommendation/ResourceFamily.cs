@@ -1,3 +1,9 @@
+// BUILD MARKER: ResourceFamily r4 — Check + Correct + Swap + read-does-not-cover-family.
+// Verify the file on disk is this one:
+//   Select-String -Path ResourceFamily.cs -Pattern "public sealed record Swap"
+// If that returns nothing, you have an older copy and RecommendationModels.cs will not
+// compile (CS0426: the type name 'Swap' does not exist in the type 'ResourceFamily').
+
 namespace AccessCheck.Core.Recommendation;
 
 /// <summary>
@@ -88,7 +94,11 @@ public static class ResourceFamily
                 "session", "sign out", "signout", "sign-out",
                 "revoke token", "refresh token", "revoke access"
             },
-            new[] { "invalidateAllRefreshTokens" }),
+            // A family is covered by ANY segment that acts on it. Listing only
+            // invalidateAllRefreshTokens made agentUsers/revokeSignInSessions read as "does
+            // not act on sessions", which is false — it acts on sessions, just on the wrong
+            // object. That is check 2's job to report, not check 1's.
+            new[] { "invalidateAllRefreshTokens", "revokeSignInSessions", "signInSessions" }),
 
         new("licences",
             new[] { "licence", "license", "sku" },
@@ -136,16 +146,34 @@ public static class ResourceFamily
         var candidates = (candidateActions ?? Enumerable.Empty<string>())
             .Where(a => !string.IsNullOrWhiteSpace(a)).ToList();
 
-        var text = " " + requestText.ToLowerInvariant() + " ";
+        // A FORBIDDEN RESOURCE IS NOT A REQUIRED ONE — and this guard does not merely warn,
+        // it CHANGES THE PERMISSION SET. On "They should not be able to create normal user
+        // accounts or manage anyone's licences", the word "licences" appears only in the
+        // prohibition, and Correct() responded by ADDING users/assignLicense. The app granted
+        // exactly what the operator had excluded, which is the one failure mode worse than a
+        // false warning.
+        var text = " " + RequestNegation.Positive(requestText).ToLowerInvariant() + " ";
         var requestedObject = RequestedObjectType(text);
         var intendedVerb = IntendedVerb(text);
+        var wantsStateChange = intendedVerb is not null
+            && !intendedVerb.Equals("read", StringComparison.OrdinalIgnoreCase);
 
         // --- 1. a named family that nothing chosen acts on ---
         foreach (var family in Families)
         {
             if (!family.RequestKeywords.Any(k => text.Contains(k, StringComparison.Ordinal)))
                 continue;
-            if (chosen.Any(a => ActsOnFamily(a, family)))
+            // A READ ACTION DOES NOT COVER THE FAMILY FOR A WRITE TASK.
+            //
+            // This is what made the guard silent on "reset MFA methods": the model chose
+            // authenticationMethods/standard/restrictedRead alongside users/basic/update.
+            // restrictedRead DOES act on authentication methods, so the family read as
+            // covered and nothing was flagged — then TaskCoverage stripped the read action
+            // afterwards, leaving a requirement set with nothing on the family at all.
+            // The same rule TaskCoverage applies has to apply here, or a read permission
+            // masks the missing write until it is too late to correct it.
+            if (chosen.Any(a => ActsOnFamily(a, family)
+                                && (!wantsStateChange || IsWriteVerb(VerbOf(a)))))
                 continue;
 
             // Blame the closest thing chosen: same object, and a WRITE, because that is the
@@ -153,7 +181,12 @@ public static class ResourceFamily
             var offender = chosen.FirstOrDefault(a =>
                 requestedObject is not null
                 && string.Equals(ObjectTypeOf(a), requestedObject, StringComparison.OrdinalIgnoreCase)
-                && IsWriteVerb(VerbOf(a)));
+                && IsWriteVerb(VerbOf(a))
+                // ...and is NOT already doing a job the request explicitly named. A compound
+                // request ("disable their account, revoke their sessions, wipe their laptop")
+                // is several tasks; blaming users/disable for not revoking sessions punishes
+                // a permission that was chosen correctly for a different clause.
+                && !DoesAJobTheRequestNamed(a, text));
 
             var message = offender is null
                 ? "The request is about " + family.Name +
@@ -188,6 +221,17 @@ public static class ResourceFamily
                     ? swapped
                     : null;
 
+                // The same operation on the right object is often named differently rather
+                // than absent: users/revokeSignInSessions does not exist, but
+                // users/invalidateAllRefreshTokens does the job. Fall back to the family the
+                // offending action belongs to and find the right-object member of it.
+                if (better is null)
+                {
+                    var ownFamily = Families.FirstOrDefault(fam => ActsOnFamily(action, fam));
+                    if (ownFamily is not null)
+                        better = BestCandidate(candidates, ownFamily, requestedObject, intendedVerb);
+                }
+
                 findings.Add(new Finding
                 {
                     Kind = FindingKind.DistinctObject,
@@ -201,6 +245,101 @@ public static class ResourceFamily
         }
 
         return findings;
+    }
+
+    /// <summary>
+    /// One wrong-resource correction: what was swapped, what was dropped, and why.
+    /// </summary>
+    public sealed record Correction
+    {
+        /// <summary>The action list to actually use — corrected.</summary>
+        public required IReadOnlyList<string> Actions { get; init; }
+        public required IReadOnlyList<Swap> Substituted { get; init; }
+        /// <summary>Wrong for the requested resource with no replacement in the catalog.</summary>
+        public required IReadOnlyList<string> Removed { get; init; }
+        public required IReadOnlyList<Finding> Findings { get; init; }
+
+        public bool Changed => Substituted.Count > 0 || Removed.Count > 0;
+    }
+
+    public sealed record Swap
+    {
+        public required string Wrong { get; init; }
+        public required string Right { get; init; }
+        public required string Why { get; init; }
+    }
+
+    /// <summary>
+    /// APPLIES what <see cref="Check"/> finds, instead of only reporting it.
+    ///
+    /// Detecting the wrong permission and then ranking roles against it anyway is how a
+    /// request that named the right role ended up "covers part only": the requirement set
+    /// still contained an action nothing could satisfy. Where the catalog holds the correct
+    /// permission, substitute it; where it does not, drop the wrong one rather than let it
+    /// shape the recommendation. Both are reported so nothing changes silently.
+    ///
+    /// MUST run on the WHOLE request, before actions are split by provider — a family owned
+    /// by one service looks uncovered from inside another service's slice.
+    /// </summary>
+    public static Correction Correct(
+        string requestText,
+        IEnumerable<string> chosenActions,
+        IEnumerable<string> candidateActions)
+    {
+        var actions = (chosenActions ?? Enumerable.Empty<string>())
+            .Where(a => !string.IsNullOrWhiteSpace(a)).ToList();
+
+        var findings = Check(requestText, actions, candidateActions);
+        if (findings.Count == 0)
+        {
+            return new Correction
+            {
+                Actions = actions,
+                Substituted = Array.Empty<Swap>(),
+                Removed = Array.Empty<string>(),
+                Findings = findings
+            };
+        }
+
+        var swaps = new List<Swap>();
+        var removed = new List<string>();
+        var result = new List<string>(actions);
+
+        foreach (var f in findings)
+        {
+            // Nothing chosen was blamable — the finding names a gap, not a wrong pick. Add
+            // the right permission rather than removing something that was never wrong.
+            if (string.IsNullOrWhiteSpace(f.Action))
+            {
+                if (f.Better is not null
+                    && !result.Contains(f.Better, StringComparer.OrdinalIgnoreCase))
+                {
+                    result.Add(f.Better);
+                    swaps.Add(new Swap { Wrong = "", Right = f.Better, Why = f.Message });
+                }
+                continue;
+            }
+
+            result.RemoveAll(a => a.Equals(f.Action, StringComparison.OrdinalIgnoreCase));
+
+            if (f.Better is null)
+            {
+                removed.Add(f.Action);
+                continue;
+            }
+
+            if (!result.Contains(f.Better, StringComparer.OrdinalIgnoreCase))
+                result.Add(f.Better);
+            swaps.Add(new Swap { Wrong = f.Action, Right = f.Better, Why = f.Message });
+        }
+
+        return new Correction
+        {
+            Actions = result,
+            Substituted = swaps,
+            Removed = removed,
+            Findings = findings
+        };
     }
 
     // ---- action parsing ---------------------------------------------------------------
@@ -237,6 +376,17 @@ public static class ResourceFamily
         if (segments is null) return false;
         return segments.Any(s =>
             family.PathSegments.Any(f => string.Equals(s, f, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>
+    /// True when the action's own operation is one the request asked for by name, so it is
+    /// answering some clause of a compound request rather than missing the point.
+    /// </summary>
+    private static bool DoesAJobTheRequestNamed(string action, string paddedText)
+    {
+        var verb = VerbOf(action);
+        if (string.IsNullOrWhiteSpace(verb)) return false;
+        return paddedText.Contains(" " + verb.ToLowerInvariant(), StringComparison.Ordinal);
     }
 
     private static bool IsWriteVerb(string? verb) =>

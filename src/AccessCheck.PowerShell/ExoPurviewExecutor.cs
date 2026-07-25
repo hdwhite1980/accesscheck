@@ -86,6 +86,83 @@ public sealed class ExoPurviewExecutor
             .ToList();
     }
 
+    /// <summary>
+    /// Refuses to return a script that would fail on an empty or MISSING required argument.
+    ///
+    /// "The property DisplayName can't be empty" was chased down two call paths and came
+    /// back both times, because the fault is not in any one of them — a blank name can reach
+    /// emission from several directions. So the check lives on the OUTPUT, where every path
+    /// converges and no future one can bypass it. It names the offending line, which is what
+    /// Exchange's own error does not: it says what was empty, never which call.
+    ///
+    /// TWO CLASSES, because the second one got through the first version:
+    ///   PRESENT BUT BLANK   -Name ''            — a literal empty value.
+    ///   REQUIRED BUT ABSENT  New-RoleGroup with no -DisplayName. Nothing in the script is
+    ///                        empty; the SERVICE supplies the empty. Documented optional,
+    ///                        derived from -Name by Exchange Online, NOT derived by Security
+    ///                        &amp; Compliance. A scan for blank values can never see this.
+    /// </summary>
+    private static string Guarded(StringBuilder sb)
+    {
+        var script = sb.ToString();
+
+        // Parameters whose value can never legitimately be blank.
+        string[] required = { "Name", "Identity", "DisplayName", "Member", "Parent", "Roles" };
+
+        // Cmdlet -> parameters the SERVICE requires even where the docs call them optional.
+        var mustCarry = new (string Cmdlet, string[] Parameters)[]
+        {
+            ("New-RoleGroup", new[] { "Name", "DisplayName" })
+        };
+
+        var lineNo = 0;
+        foreach (var line in script.Split('\n'))
+        {
+            lineNo++;
+
+            foreach (var param in required)
+            {
+                if (line.Contains("-" + param + " ''", StringComparison.Ordinal)
+                    || line.Contains("-" + param + " \"\"", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "This grant would run a command with an EMPTY -" + param
+                        + ", which the service rejects (\"The property DisplayName can't be "
+                        + "empty\" or similar). Nothing was run."
+                        + Environment.NewLine + Environment.NewLine
+                        + "Offending line " + lineNo + ":" + Environment.NewLine
+                        + "  " + line.Trim()
+                        + Environment.NewLine + Environment.NewLine
+                        + "This usually means the selected option carried no role name. "
+                        + "Re-analyze the request and pick a role from the dropdown before "
+                        + "approving.");
+                }
+            }
+
+            foreach (var (cmdlet, parameters) in mustCarry)
+            {
+                if (!line.Contains(cmdlet, StringComparison.OrdinalIgnoreCase)) continue;
+                if (line.TrimStart().StartsWith("#", StringComparison.Ordinal)) continue;
+
+                var absent = parameters
+                    .Where(p => !line.Contains("-" + p + " ", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (absent.Count == 0) continue;
+
+                throw new InvalidOperationException(
+                    cmdlet + " is being called without -" + string.Join(", -", absent)
+                    + ". Security & Compliance does not fill these in from -Name the way "
+                    + "Exchange Online does, so the call fails with \"The property DisplayName "
+                    + "can't be empty\". Nothing was run."
+                    + Environment.NewLine + Environment.NewLine
+                    + "Offending line " + lineNo + ":" + Environment.NewLine
+                    + "  " + line.Trim());
+            }
+        }
+
+        return script;
+    }
+
     // ---------- script builders (pure — shown to the approver before any run) ----------
 
     /// <summary>
@@ -145,7 +222,14 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("  # Role group carrying the grant");
         sb.AppendLine("  if (-not (Get-RoleGroup -Identity '" + PsEnvironment.PsQ(groupName) +
                       "' -ErrorAction SilentlyContinue)) {");
+        // -DisplayName IS REQUIRED IN SECURITY & COMPLIANCE. Documented optional for both,
+        // and Exchange Online derives it from -Name — Security & Compliance does not, so the
+        // object reaches validation with the property blank and throws
+        // "DisplayName: The property DisplayName can't be empty". Fifth instance of the
+        // Exchange-vs-SCC trap, and the subtlest: the cmdlet and the parameter both exist in
+        // both, only the server-side DEFAULT differs, so Get-Command cannot detect it.
         sb.AppendLine("    New-RoleGroup -Name '" + PsEnvironment.PsQ(groupName) +
+                      "' -DisplayName '" + PsEnvironment.PsQ(groupName) +
                       "' -Roles '" + PsEnvironment.PsQ(roleToGrant) +
                       "' -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) + "' | Out-Null");
         sb.AppendLine("  }");
@@ -155,7 +239,7 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = '" +
                       PsEnvironment.PsQ(groupName) + "'; role = '" + PsEnvironment.PsQ(roleToGrant) + "' }");
         Epilogue(sb);
-        return sb.ToString();
+        return Guarded(sb);
     }
 
     /// <summary>
@@ -240,7 +324,7 @@ public sealed class ExoPurviewExecutor
 
         sb.AppendLine("  # ONE role group carrying every role the plan needs");
         sb.AppendLine("  if (-not (Get-RoleGroup -Identity $groupName -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("    New-RoleGroup -Name $groupName" +
+        sb.AppendLine("    New-RoleGroup -Name $groupName -DisplayName $groupName" +
                       " -Roles " + roleList +
                       " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
                       "' | Out-Null");
@@ -281,7 +365,7 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("      }");
         sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###existing group carries the wrong roles; using ' + $picked)");
         sb.AppendLine("      if (-not (Get-RoleGroup -Identity $picked -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("        New-RoleGroup -Name $picked -Roles " + roleList +
+        sb.AppendLine("        New-RoleGroup -Name $picked -DisplayName $picked -Roles " + roleList +
                       " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
                       "' | Out-Null");
         sb.AppendLine("      }");
@@ -304,7 +388,7 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = $groupName; " +
                       "roles = $finalRoles; created = $created; reused = $reused; members = $members }");
         Epilogue(sb);
-        return sb.ToString();
+        return Guarded(sb);
     }
 
     public string BuildRemoveMemberScript(RbacScope scope, string groupName, string memberIdentity)
@@ -316,7 +400,7 @@ public sealed class ExoPurviewExecutor
                       "'" + BypassSwitch(scope) + " -Confirm:$false -ErrorAction Stop");
         sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true }");
         Epilogue(sb);
-        return sb.ToString();
+        return Guarded(sb);
     }
 
     /// <summary>Lists AccessCheck role groups with their member counts, for housekeeping.</summary>
@@ -331,7 +415,7 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("  })");
         sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; groups = $groups }");
         Epilogue(sb);
-        return sb.ToString();
+        return Guarded(sb);
     }
 
     public string BuildDeleteGroupAndRoleScript(
@@ -348,7 +432,7 @@ public sealed class ExoPurviewExecutor
         }
         sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true }");
         Epilogue(sb);
-        return sb.ToString();
+        return Guarded(sb);
     }
 
     // ---------- execution ----------

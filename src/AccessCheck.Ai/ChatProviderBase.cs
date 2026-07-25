@@ -34,6 +34,28 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
     protected abstract Task<string> SendChatAsync(string system, string user, CancellationToken ct);
 
     /// <summary>
+    /// This transport's web-search tool declaration, or null when it has none.
+    ///
+    /// EVERY VENDOR SPELLS THIS DIFFERENTLY and some endpoints have no search at all — a
+    /// gateway on a government network usually does not. So the capability is declared per
+    /// transport rather than assumed, and the PROMPT is written to work either way: with
+    /// search the model cites documentation, without it the model may cite only the
+    /// candidate list, and with neither it must return empty rather than answer from
+    /// memory. Nothing above this line needs to know which kind of endpoint it is talking
+    /// to.
+    ///
+    /// Override in the subclass and include it in the request body when non-null, e.g.
+    ///   Anthropic  new { type = "web_search_20250305", name = "web_search" }
+    ///   OpenAI     new { type = "web_search" }
+    ///   Gemini     new { google_search = new { } }
+    /// Leave as null for a gateway that does not support it.
+    /// </summary>
+    protected virtual object? WebSearchTool => null;
+
+    /// <summary>True when this endpoint can look documentation up rather than recall it.</summary>
+    public bool CanSearch => WebSearchTool is not null;
+
+    /// <summary>
     /// Proposes the permissions a function needs, in three stages.
     ///
     /// A. WHICH SERVICE owns this feature? Product feature names ("GPO analytics",
@@ -112,7 +134,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
         if (services.Count > 0)
         {
             var fromService = PermissionIndex.PermissionsInProviders(
-                services, catalog, functionDescription).ToList();
+                services, catalog, functionDescription, reference: reference).ToList();
 
             if (fromService.Count > 0)
             {
@@ -176,9 +198,12 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
         PromptLogger?.Invoke("permissions", permissionUser);
         LastPromptSha256 = PromptBuilder.Sha256Hex(permissionUser);
 
-        var chosenRaw = StripFences(
-            await SendChatAsync(PromptBuilder.PermissionSystem, permissionUser, ct));
-        var parsed = ParseSuggestion(chosenRaw);
+        // ONE RETRY ON A FORMATTING SLIP. The model writes the correct answer as prose often
+        // enough that discarding the whole request over it is the single biggest source of
+        // lost runs — three in one test batch, each of which had named the right permission
+        // in the text. Salvage first, then ask once more with a terse reminder. If it fails
+        // twice the error surfaces exactly as before.
+        var parsed = await ChooseWithRetryAsync(permissionUser, ct);
 
         // Accept only what was offered — but resolve the model's phrasing back to the exact
         // catalog string first. Exchange candidates are full cmdlet signatures and the model
@@ -297,7 +322,14 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
             Reasoning = reasoning,
             Confidence = confidence,
             IdentifiedServices = services,
-            CandidatesConsidered = candidates.Count
+            CandidatesConsidered = candidates.Count,
+            // Only citations for actions that SURVIVED resolution. A citation for an action
+            // the resolver dropped would describe something not being granted.
+            Evidence = parsed.Evidence
+                .Where(c => kept.Contains(c.Action, StringComparer.OrdinalIgnoreCase))
+                .ToList(),
+            DocumentedRole = parsed.DocumentedRole,
+            CustomRoleEligible = parsed.CustomRoleEligible
         };
     }
 
@@ -366,11 +398,56 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
                 rs.ValueKind == JsonValueKind.String)
                 reasoning = rs.GetString() ?? "";
 
+            // EVIDENCE. The model must quote the description it relied on and say where it
+            // came from. Parsed here so the deterministic layer can check a prose claim
+            // against Microsoft's own reference — previously the reasoning was displayed
+            // and never verified, which is how "typically includes resetting authentication
+            // methods" reached the approval screen looking like a finding.
+            var evidence = new List<ActionCitation>();
+            if (root.TryGetProperty("evidence", out var ev) &&
+                ev.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in ev.EnumerateArray())
+                {
+                    if (el.ValueKind != JsonValueKind.Object) continue;
+                    var a = el.TryGetProperty("action", out var ea) ? ea.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(a)) continue;
+                    evidence.Add(new ActionCitation
+                    {
+                        Action = a!.Trim(),
+                        Description = el.TryGetProperty("description", out var ed)
+                            ? ed.GetString() ?? "" : "",
+                        Source = el.TryGetProperty("source", out var es)
+                            ? es.GetString() ?? "" : ""
+                    });
+                }
+            }
+
+            bool? customRoleEligible = null;
+            if (root.TryGetProperty("customRoleEligible", out var cre))
+            {
+                if (cre.ValueKind == JsonValueKind.True) customRoleEligible = true;
+                else if (cre.ValueKind == JsonValueKind.False) customRoleEligible = false;
+            }
+
+            string? documentedRole = null;
+            if (root.TryGetProperty("documentedRole", out var dr) &&
+                dr.ValueKind == JsonValueKind.String)
+            {
+                var v = dr.GetString();
+                if (!string.IsNullOrWhiteSpace(v) &&
+                    !string.Equals(v, "null", StringComparison.OrdinalIgnoreCase))
+                    documentedRole = v;
+            }
+
             return new AiSuggestion
             {
                 RequiredActions = actions,
                 RecommendedRoleId = roleId,
-                Reasoning = reasoning
+                Reasoning = reasoning,
+                Evidence = evidence,
+                DocumentedRole = documentedRole,
+                CustomRoleEligible = customRoleEligible
             };
         }
         catch (JsonException ex)
@@ -378,6 +455,69 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
             throw new InvalidDataException(
                 "AI response was not the expected JSON shape: " + Truncate(raw, 300), ex);
         }
+    }
+
+    /// <summary>
+    /// Sends the choose prompt, and if the reply is not JSON, asks once more for JSON only.
+    /// </summary>
+    private async Task<AiSuggestion> ChooseWithRetryAsync(string permissionUser, CancellationToken ct)
+    {
+        var raw = StripFences(await SendChatAsync(PromptBuilder.PermissionSystem, permissionUser, ct));
+        try
+        {
+            return ParseSuggestion(raw);
+        }
+        catch (InvalidDataException)
+        {
+            // The reminder is deliberately blunt and repeats the schema, because the failures
+            // are always the same shape: a numbered explanation of the right answer with no
+            // JSON around it.
+            var retryUser = permissionUser
+                + "\n\nYOUR PREVIOUS REPLY WAS NOT JSON AND WAS DISCARDED. Reply with the JSON "
+                + "object ONLY — no explanation before or after it, no numbered list, no "
+                + "markdown. Start your reply with { and end it with }.";
+
+            var retryRaw = StripFences(
+                await SendChatAsync(PromptBuilder.PermissionSystem, retryUser, ct));
+            return ParseSuggestion(retryRaw);
+        }
+    }
+
+    /// <summary>
+    /// The first balanced {...} in the text, or null. Models frequently wrap correct JSON in
+    /// a sentence of explanation; throwing that away loses an answer we already have.
+    /// </summary>
+    protected static string? ExtractJsonObject(string s)
+    {
+        var start = s.IndexOf('{', StringComparison.Ordinal);
+        if (start < 0) return null;
+
+        var depth = 0;
+        var inString = false;
+        var escaped = false;
+
+        for (var i = start; i < s.Length; i++)
+        {
+            var c = s[i];
+
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+
+            if (c == '"') inString = true;
+            else if (c == '{') depth++;
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0) return s[start..(i + 1)];
+            }
+        }
+
+        return null;
     }
 
     protected static string StripFences(string s)
@@ -390,6 +530,12 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
             var lastFence = t.LastIndexOf("```", StringComparison.Ordinal);
             if (lastFence >= 0) t = t[..lastFence];
         }
+        t = t.Trim();
+
+        // Prose wrapped around correct JSON is common and recoverable. Only reach for this
+        // when the reply is not already an object, so well-formed answers are untouched.
+        if (!t.StartsWith('{')) t = ExtractJsonObject(t) ?? t;
+
         return t.Trim();
     }
 

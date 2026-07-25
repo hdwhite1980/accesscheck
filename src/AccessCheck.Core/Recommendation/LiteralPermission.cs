@@ -50,6 +50,15 @@ public static class LiteralPermission
         }
     }
 
+    /// <summary>
+    /// True when the token could only be a permission string — not merely something with a
+    /// hyphen in it. Used to decide whether a token that FAILED to resolve is worth
+    /// reporting as missing.
+    /// </summary>
+    private static bool IsUnambiguousPermissionShape(string token) =>
+        (token.Contains('/') && token.Contains('.'))
+        || token.StartsWith("Microsoft.Intune_", StringComparison.OrdinalIgnoreCase);
+
     public static Detection Detect(
         string functionDescription,
         Catalog.RoleCatalog catalog,
@@ -59,7 +68,19 @@ public static class LiteralPermission
         var notFound = new List<string>();
         var suggestions = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var token in CandidateTokens(functionDescription).Distinct(StringComparer.OrdinalIgnoreCase))
+        // A permission named in a PROHIBITION is not a request for it, and this detector
+        // short-circuits the model entirely — a token picked up here reaches the proposal
+        // without passing through the candidate list.
+        var asked = RequestNegation.Positive(functionDescription);
+
+        // Built ONCE. It canonicalises the whole reference — roughly 1,200 entries — so
+        // constructing it per token would redo that work for every candidate string in the
+        // request.
+        var referenceNames = referenceActions is null
+            ? null
+            : new ActionNameMatch.NameResolver(referenceActions);
+
+        foreach (var token in CandidateTokens(asked).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (catalog.ActionExists(token))
             {
@@ -67,14 +88,29 @@ public static class LiteralPermission
                 continue;
             }
 
-            var fromReference = referenceActions?
-                .FirstOrDefault(a => a.Equals(token, StringComparison.OrdinalIgnoreCase));
+            // Resolver, not exact match: the reference and the catalog spell the same Intune
+            // permission differently ("Devicecompliancepolicies" against Microsoft's own
+            // misspelled "DeviceCompliancePolices"), so an operator naming either form must
+            // resolve to the other.
+            var fromReference = referenceNames?.Resolve(token);
             if (fromReference is not null)
             {
                 if (!resolved.Contains(fromReference, StringComparer.OrdinalIgnoreCase))
                     resolved.Add(fromReference);
                 continue;
             }
+
+            // UNRESOLVED CMDLET SHAPES ARE JUST ENGLISH. "factory-reset the laptop" and
+            // "Read-only is fine" both parse as Verb-Noun, and reporting them as permissions
+            // that do not exist abandoned the whole request with "No confident match" before
+            // the model's correct answer was even looked at. Hyphens are everywhere in
+            // prose: sign-in, read-only, e-mail, factory-reset.
+            //
+            // A slash-and-dot resource action or an Intune underscored name is distinctive
+            // enough that naming one and getting it wrong is worth reporting. A bare
+            // hyphenated word is not, so it is dropped silently and the request proceeds
+            // normally.
+            if (!IsUnambiguousPermissionShape(token)) continue;
 
             notFound.Add(token);
             suggestions[token] = NearMatches(token, catalog, referenceActions);

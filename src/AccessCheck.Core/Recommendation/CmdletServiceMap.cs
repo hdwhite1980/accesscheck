@@ -127,7 +127,10 @@ public static class CmdletServiceMap
     /// <summary>Prompt guidance so the model attributes the service correctly first time.</summary>
     public static IReadOnlyList<string> PromptHints(string functionDescription)
     {
-        var text = functionDescription.ToLowerInvariant();
+        // Hints must come from what the request ASKS FOR. "They should not be able to purge
+        // anything" contains "purge", and would have produced a hint instructing the model to
+        // choose Purview purge permissions — the app steering toward the forbidden capability.
+        var text = RequestNegation.Positive(functionDescription).ToLowerInvariant();
         var hints = new List<string>();
 
         // "permanently delete it" matched none of the original triggers, and the model
