@@ -206,8 +206,11 @@ public sealed class RecommendationValidator
             // description supports the requested operation." Adding it to `valid` and then
             // flagging it meant it still drove role selection, still shaped the excess
             // calculation, and still appeared as a recommendation.
+            // The whole proposed set, so a read can be recognised as a companion to a write
+            // on the same resource rather than judged alone.
             var coverage = TaskCoverage.Evaluate(
-                functionDescription, action, DescriptionFor(catalog, action));
+                functionDescription, action, DescriptionFor(catalog, action),
+                suggestion.RequiredActions);
 
             if (coverage.Status == TaskCoverage.Status.Contradicted)
             {
@@ -529,6 +532,28 @@ public sealed class RecommendationValidator
     /// <summary>Microsoft's descriptions, keyed by action. Supplied by the caller.</summary>
     public IReadOnlyDictionary<string, string>? ReferenceDescriptions { get; set; }
 
+    /// <summary>
+    /// Roles that exist in the catalog but are NEVER a grant.
+    ///
+    /// User, Guest User and Restricted Guest User are Entra's IMPLICIT roles — every
+    /// principal already holds one, and the permissions they carry are scoped to SELF. They
+    /// list microsoft.directory/users/authenticationMethods/basic/update because you may
+    /// change your OWN authentication methods, not anyone else's.
+    ///
+    /// Left in the ranking they win constantly, because they carry almost no excess: on an
+    /// MFA-reset request 'Restricted Guest User' was recommended over Authentication
+    /// Administrator. Assigning it grants the recipient nothing they did not already have
+    /// and lets them reset nobody. The deprecated partner and device-join roles are here for
+    /// the same reason — Microsoft documents them as not for customer assignment.
+    /// </summary>
+    private static readonly HashSet<string> NeverGrantableRoles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "User", "Guest User", "Restricted Guest User",
+        "Directory Synchronization Accounts",
+        "Partner Tier1 Support", "Partner Tier2 Support",
+        "Device Join", "Workplace Device Join"
+    };
+
     private static List<RoleFit> RankFits(RoleCatalog catalog, IReadOnlyList<string> required)
     {
         var fits = new List<RoleFit>();
@@ -547,6 +572,9 @@ public sealed class RecommendationValidator
             // so literal containment reported a role that plainly covers a read-only request
             // as not covering it. ActionRisk prices rollups as categories, so a role covering
             // this way still ranks below an exact one.
+            // Implicit and deprecated roles are not grants, however well they score.
+            if (NeverGrantableRoles.Contains(role.DisplayName)) continue;
+
             var missing = required
                 .Where(a => !ActionCoverage.CoveredBy(a, role.AllowedResourceActions))
                 .ToList();

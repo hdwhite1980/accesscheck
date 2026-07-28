@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using AccessCheck.Core.Audit;
 
 namespace AccessCheck.PowerShell;
 
@@ -50,6 +51,11 @@ public sealed class PowerShellRunner
         ScriptLogger?.Invoke(script);
 
         var exe = FindPowerShell();
+        // The script verbatim. ScriptLogger already receives it, but that log is separate
+        // from the response side — pairing them under one scope is what makes a failed
+        // Exchange grant readable after the fact.
+        ActionLog.Request("PWSH", "RUN", exe, script);
+        var swRun = Stopwatch.StartNew();
         var scriptPath = Path.Combine(Path.GetTempPath(),
             "accesscheck-" + Guid.NewGuid().ToString("N") + ".ps1");
         await File.WriteAllTextAsync(scriptPath, script, new UTF8Encoding(false), ct);
@@ -117,7 +123,21 @@ public sealed class PowerShellRunner
             // Both streams signal completion with a null Data event.
             await Task.WhenAny(Task.WhenAll(stdOutDone.Task, stdErrDone.Task),
                                Task.Delay(TimeSpan.FromSeconds(5), ct));
-            return new PsResult(proc.ExitCode, stdOut.ToString(), stdErr.ToString());
+            swRun.Stop();
+
+            var outText = stdOut.ToString();
+            var errText = stdErr.ToString();
+
+            // BOTH streams, in full. stderr is where Exchange puts the reason a cmdlet
+            // refused, and it was previously only surfaced if something chose to show it.
+            ActionLog.Response("PWSH", proc.ExitCode,
+                "--- stdout ---" + Environment.NewLine + outText
+                + (errText.Length > 0
+                    ? Environment.NewLine + "--- stderr ---" + Environment.NewLine + errText
+                    : ""),
+                swRun.ElapsedMilliseconds);
+
+            return new PsResult(proc.ExitCode, outText, errText);
         }
         finally
         {

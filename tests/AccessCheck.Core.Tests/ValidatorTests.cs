@@ -84,10 +84,10 @@ public class ValidatorTests
         Assert.NotNull(outcome.BestFit);
         Assert.Equal("role-helpdesk", outcome.BestFit!.RoleId);
 
-        // users/standard/read was REQUESTED but is not in the required set: "reset passwords"
-        // is a write task and TaskCoverage excludes a read permission from performing it. It
-        // is therefore excess in whichever role grants it. Asserting a raw count here made
-        // this ranking test brittle to that rule, so it asserts the ranking instead.
+        // users/standard/read survives as a COMPANION read — users/password/update writes to
+        // the same resource in the same proposal — so it is part of the requirement, not
+        // excess. Asserting a raw excess count made this ranking test brittle to that rule,
+        // so it asserts the ranking instead.
         Assert.Contains("microsoft.directory/users/invalidateAllRefreshTokens",
             outcome.BestFit.ExcessActions);
         Assert.DoesNotContain("microsoft.directory/users/password/update",

@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using AccessCheck.Core.Audit;
 
 namespace AccessCheck.Graph;
 
@@ -58,8 +59,26 @@ public sealed class GraphClient : IDisposable
     {
         var token = await _auth.GetTokenAsync(ct);
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        // The FULL request and the FULL response, not the 300-character summary
+        // DescribeError keeps. That truncation is fine for a dialog and useless for
+        // diagnosis: "400 Request_BadRequest: Action 'microsoft.directory/use…" cuts off
+        // exactly the part that names what Microsoft refused.
+        string? requestBody = null;
+        if (ActionLog.Enabled && req.Content is not null)
+        {
+            try { requestBody = await req.Content.ReadAsStringAsync(ct); }
+            catch (Exception) { requestBody = "(request body could not be read for logging)"; }
+        }
+        ActionLog.Request("GRAPH", req.Method.Method, req.RequestUri?.ToString() ?? "", requestBody);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         using var resp = await _http.SendAsync(req, ct);
         var text = await resp.Content.ReadAsStringAsync(ct);
+        sw.Stop();
+
+        ActionLog.Response("GRAPH", (int)resp.StatusCode, text, sw.ElapsedMilliseconds);
+
         if (!resp.IsSuccessStatusCode)
             throw new GraphApiException((int)resp.StatusCode, DescribeError(text),
                 req.RequestUri?.ToString() ?? "");

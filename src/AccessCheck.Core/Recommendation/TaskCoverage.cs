@@ -48,7 +48,36 @@ public static class TaskCoverage
     /// Compares the operation the REQUEST asks for against what the ACTION performs.
     /// Only returns Contradicted when both sides are clear and they conflict.
     /// </summary>
-    public static Result Evaluate(string? functionDescription, string? action, string? description)
+    /// <summary>
+    /// The resource an action acts on, at the level that decides whether two actions are
+    /// working on the same thing. "microsoft.directory/users/..." -> "microsoft.directory/users";
+    /// "Get-Mailbox" -> "mailbox".
+    /// </summary>
+    private static string ResourceKey(string action)
+    {
+        var a = action.Trim();
+        if (a.Contains('-', StringComparison.Ordinal) && !a.Contains('/', StringComparison.Ordinal))
+        {
+            var dash = a.IndexOf('-', StringComparison.Ordinal);
+            return a[(dash + 1)..].ToLowerInvariant();
+        }
+
+        var parts = a.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length >= 2
+            ? (parts[0] + "/" + parts[1]).ToLowerInvariant()
+            : a.ToLowerInvariant();
+    }
+
+    private static bool PerformsWrite(string action)
+    {
+        var n = action.ToLowerInvariant();
+        if (ReadOnlyMarkers.Any(m => n.EndsWith(m, StringComparison.Ordinal))) return false;
+        return WriteMarkers.Any(m => n.Contains(m, StringComparison.Ordinal));
+    }
+
+    public static Result Evaluate(
+        string? functionDescription, string? action, string? description,
+        IReadOnlyCollection<string>? proposedAlongside = null)
     {
         // Normalise ONCE into non-null locals. Guarding with `?? ""` at the point of use
         // told the compiler the parameter might be null and then assigned it straight into
@@ -98,6 +127,34 @@ public static class TaskCoverage
 
         if (looksRead)
         {
+            // A COMPANION READ IS NOT A SUBSTITUTE FOR THE WRITE.
+            //
+            // The rule below is right when a read is offered INSTEAD of a write — that is a
+            // grant that cannot do the job. It is wrong when the read is offered ALONGSIDE
+            // one on the same resource, which is how the work is actually done: find the
+            // user, then reset them. Microsoft's own roles are built that way — Helpdesk
+            // Administrator carries users/standard/read next to users/password/update, and
+            // Authentication Administrator carries authenticationMethods/standard/restrictedRead
+            // next to its writes. Excluding those made the app under-grant and left the
+            // recommendation unable to complete the task it was approved for.
+            var companionTo = proposedAlongside?.FirstOrDefault(other =>
+                !string.Equals(other, safeAction, StringComparison.OrdinalIgnoreCase)
+                && ResourceKey(other) == ResourceKey(safeAction)
+                && PerformsWrite(other));
+
+            if (companionTo is not null)
+            {
+                return new Result
+                {
+                    Action = safeAction,
+                    Status = Status.Partial,
+                    Reason = "Read-only, and on its own it cannot perform the requested "
+                           + "operation — but '" + companionTo + "' in the same proposal "
+                           + "writes to the same resource, so this is a COMPANION read rather "
+                           + "than a substitute for the write. Kept."
+                };
+            }
+
             var op = requested.First(o => o is "delete" or "create" or "update");
             return new Result
             {
@@ -133,6 +190,10 @@ public static class TaskCoverage
 
     public static IReadOnlyList<Result> EvaluateAll(
         string? functionDescription,
-        IEnumerable<(string Action, string Description)> actions) =>
-        actions.Select(a => Evaluate(functionDescription, a.Action, a.Description)).ToList();
+        IEnumerable<(string Action, string Description)> actions)
+    {
+        var all = actions as IReadOnlyList<(string Action, string Description)> ?? actions.ToList();
+        var names = all.Select(a => a.Action).ToList();
+        return all.Select(a => Evaluate(functionDescription, a.Action, a.Description, names)).ToList();
+    }
 }

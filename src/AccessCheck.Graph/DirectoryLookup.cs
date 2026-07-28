@@ -137,6 +137,39 @@ public sealed class DirectoryLookup
         return hits;
     }
 
+    /// <summary>
+    /// One group by object id, or null if it cannot be read.
+    ///
+    /// The picker already surfaces isAssignableToRole, but a PASTED GUID never went
+    /// through the picker — it passes straight into the grant, and the first anyone hears
+    /// about a plain security group is Graph refusing the role attach. This is what lets
+    /// that be checked beforehand.
+    ///
+    /// Returns null rather than throwing on 404: a group created seconds ago may not have
+    /// replicated yet, and a pre-flight that cannot read it must not block a grant that
+    /// would otherwise succeed.
+    /// </summary>
+    public async Task<GroupHit?> GetGroupByIdAsync(string groupId, CancellationToken ct = default)
+    {
+        var id = groupId.Trim();
+        if (id.Length == 0) return null;
+        try
+        {
+            using var doc = await _graph.GetAsync(
+                "/v1.0/groups/" + Uri.EscapeDataString(id)
+                + "?$select=id,displayName,isAssignableToRole,securityEnabled", ct);
+            var el = doc.RootElement;
+            return new GroupHit(
+                el.TryGetProperty("id", out var i) ? i.GetString() ?? id : id,
+                el.TryGetProperty("displayName", out var d) ? d.GetString() ?? "" : "",
+                el.TryGetProperty("isAssignableToRole", out var r) && r.ValueKind == JsonValueKind.True);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Resolves a group by exact display name; null if not found or ambiguous.</summary>
     public async Task<GroupHit?> ResolveGroupByNameAsync(
         string displayName, CancellationToken ct = default)

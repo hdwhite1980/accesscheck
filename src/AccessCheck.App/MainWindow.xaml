@@ -1,4 +1,4 @@
-<Window x:Class="AccessCheck.App.MainWindow"
+﻿<Window x:Class="AccessCheck.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="AccessCheck — Least-Privilege Access Broker"
@@ -225,6 +225,14 @@
                         <Border Style="{StaticResource Card}" x:Name="ExecutePanel" Visibility="Collapsed">
                             <StackPanel>
                                 <TextBlock Style="{StaticResource H1}" Text="Approve and execute"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <TextBlock Text="Name for created objects" Width="220" Margin="0,6,0,0"
+                                               ToolTip="Used for the custom role, the ACP- group and the ACG- role group. Prefilled from the request; edit it to something meaningful before approving."/>
+                                    <TextBox x:Name="GrantNameBox" Width="420" Margin="0,4,0,0"
+                                             ToolTip="These names are permanent objects in your tenant. The request text is a poor name for one."/>
+                                    <TextBlock Margin="10,6,0,0" Style="{StaticResource Hint}"
+                                               Text="Prefixes (AC- / ACP- / ACG-) are added automatically."/>
+                                </StackPanel>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="220"/>
@@ -593,6 +601,8 @@
                     <StackPanel DockPanel.Dock="Top" Orientation="Horizontal">
                         <TextBlock Style="{StaticResource H1}" Text="Audit history"/>
                         <Button Content="Refresh" Click="HistoryRefresh_Click" Margin="16,0,0,8"/>
+                        <Button Content="Full log..." Click="HistoryFullLog_Click" Margin="8,0,0,8"
+                                ToolTip="Every Graph and PowerShell request and response, in full — with export and AI analysis."/>
                     </StackPanel>
                     <DataGrid x:Name="HistoryGrid" AutoGenerateColumns="False" IsReadOnly="True"
                               HeadersVisibility="Column" GridLinesVisibility="Horizontal">

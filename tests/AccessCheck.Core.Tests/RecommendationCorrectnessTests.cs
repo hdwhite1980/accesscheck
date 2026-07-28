@@ -164,10 +164,63 @@ public class RecommendationCorrectnessTests
             Confidence = SuggestionConfidence.High
         }, "reset MFA methods for standard users");
 
-        Assert.DoesNotContain(outcome.ValidActions,
+        // COMPANION READ: kept, because a WRITE on the same resource is in the same proposal.
+        // Authentication Administrator carries this read next to its writes for a reason —
+        // you cannot reset a method you cannot see. Excluding it made the grant unable to
+        // complete the task it was approved for.
+        Assert.Contains(outcome.ValidActions,
             a => a.Contains("restrictedRead", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(outcome.ValidActions,
             a => a.Contains("basic/update", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ReadWithoutAnAccompanyingWriteIsStillExcluded()
+    {
+        // The other half of the rule: a read offered INSTEAD of a write is still a grant
+        // that cannot do the job, and must not reach role comparison.
+        var catalog = CatalogWith(Role(
+            "r1", "Authentication Administrator", RbacProviders.Directory, "d",
+            "microsoft.directory/users/authenticationMethods/standard/restrictedRead",
+            "microsoft.directory/users/authenticationMethods/basic/update"));
+
+        var validator = new RecommendationValidator();
+        var outcome = validator.Validate(catalog, new AiSuggestion
+        {
+            RequiredActions = new[]
+            {
+                "microsoft.directory/users/authenticationMethods/standard/restrictedRead"
+            },
+            Confidence = SuggestionConfidence.High
+        }, "reset MFA methods for standard users");
+
+        Assert.Empty(outcome.ValidActions);
+    }
+
+    [Fact]
+    public void ReadOnAnUnrelatedResourceIsStillExcluded()
+    {
+        // A write elsewhere in the proposal does not rescue a read on a different resource.
+        var catalog = CatalogWith(Role(
+            "r1", "Mixed", RbacProviders.Directory, "d",
+            "microsoft.directory/groups/standard/read",
+            "microsoft.directory/users/password/update"));
+
+        var validator = new RecommendationValidator();
+        var outcome = validator.Validate(catalog, new AiSuggestion
+        {
+            RequiredActions = new[]
+            {
+                "microsoft.directory/groups/standard/read",
+                "microsoft.directory/users/password/update"
+            },
+            Confidence = SuggestionConfidence.High
+        }, "reset passwords");
+
+        Assert.DoesNotContain(outcome.ValidActions,
+            a => a.Contains("groups/standard/read", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(outcome.ValidActions,
+            a => a.Contains("password/update", StringComparison.OrdinalIgnoreCase));
     }
 
     // ---------- descriptions must come from the reference, not the role ----------

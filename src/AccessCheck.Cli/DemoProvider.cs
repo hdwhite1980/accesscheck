@@ -18,11 +18,6 @@ public sealed class DemoProvider : IRecommendationProvider
         CancellationToken ct = default,
         ReferenceStore? reference = null)
     {
-        // Accepted to satisfy the contract and deliberately IGNORED: this stub exists to
-        // prove the pipeline runs offline, and enriching its candidates would make it look
-        // more trustworthy than it is. The validator is what makes the pipeline safe.
-        _ = reference;
-
         var catalogRoles = catalog.Roles;
         var words = functionDescription
             .ToLowerInvariant()

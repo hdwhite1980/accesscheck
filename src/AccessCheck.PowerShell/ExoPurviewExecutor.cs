@@ -87,20 +87,16 @@ public sealed class ExoPurviewExecutor
     }
 
     /// <summary>
-    /// Refuses to return a script that would fail on an empty or MISSING required argument.
+    /// Refuses to return a script containing an EMPTY required argument.
     ///
-    /// "The property DisplayName can't be empty" was chased down two call paths and came
-    /// back both times, because the fault is not in any one of them — a blank name can reach
-    /// emission from several directions. So the check lives on the OUTPUT, where every path
-    /// converges and no future one can bypass it. It names the offending line, which is what
-    /// Exchange's own error does not: it says what was empty, never which call.
+    /// "The property DisplayName can't be empty" has now been chased down two different
+    /// call paths and reappeared both times, because the failure is not really in any one
+    /// of them — it is that a blank name can reach emission from several directions and
+    /// nothing checks the finished text. So the check moves to the OUTPUT, where every
+    /// path converges and no future one can bypass it.
     ///
-    /// TWO CLASSES, because the second one got through the first version:
-    ///   PRESENT BUT BLANK   -Name ''            — a literal empty value.
-    ///   REQUIRED BUT ABSENT  New-RoleGroup with no -DisplayName. Nothing in the script is
-    ///                        empty; the SERVICE supplies the empty. Documented optional,
-    ///                        derived from -Name by Exchange Online, NOT derived by Security
-    ///                        &amp; Compliance. A scan for blank values can never see this.
+    /// It also names the offending line, which is what was missing: Exchange's error says
+    /// what was empty but not which call, and the app said nothing at all.
     /// </summary>
     private static string Guarded(StringBuilder sb)
     {
@@ -109,19 +105,13 @@ public sealed class ExoPurviewExecutor
         // Parameters whose value can never legitimately be blank.
         string[] required = { "Name", "Identity", "DisplayName", "Member", "Parent", "Roles" };
 
-        // Cmdlet -> parameters the SERVICE requires even where the docs call them optional.
-        var mustCarry = new (string Cmdlet, string[] Parameters)[]
-        {
-            ("New-RoleGroup", new[] { "Name", "DisplayName" })
-        };
-
         var lineNo = 0;
         foreach (var line in script.Split('\n'))
         {
             lineNo++;
-
             foreach (var param in required)
             {
+                // -Name '' or -Name ""  — an empty literal that will reach the service.
                 if (line.Contains("-" + param + " ''", StringComparison.Ordinal)
                     || line.Contains("-" + param + " \"\"", StringComparison.Ordinal))
                 {
@@ -138,29 +128,75 @@ public sealed class ExoPurviewExecutor
                         + "approving.");
                 }
             }
-
-            foreach (var (cmdlet, parameters) in mustCarry)
-            {
-                if (!line.Contains(cmdlet, StringComparison.OrdinalIgnoreCase)) continue;
-                if (line.TrimStart().StartsWith("#", StringComparison.Ordinal)) continue;
-
-                var absent = parameters
-                    .Where(p => !line.Contains("-" + p + " ", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-                if (absent.Count == 0) continue;
-
-                throw new InvalidOperationException(
-                    cmdlet + " is being called without -" + string.Join(", -", absent)
-                    + ". Security & Compliance does not fill these in from -Name the way "
-                    + "Exchange Online does, so the call fails with \"The property DisplayName "
-                    + "can't be empty\". Nothing was run."
-                    + Environment.NewLine + Environment.NewLine
-                    + "Offending line " + lineNo + ":" + Environment.NewLine
-                    + "  " + line.Trim());
-            }
         }
 
         return script;
+    }
+
+    /// <summary>
+    /// Emits a single server-side pipeline that keeps only the wanted cmdlets on a derived
+    /// role and removes the rest.
+    ///
+    /// A role created with -Parent inherits the parent's ENTIRE entry set — often ~200
+    /// cmdlets. Removing the unwanted ones one Remove-ManagementRoleEntry at a time meant
+    /// ~200 sequential round-trips in a single Exchange Online session, and the session was
+    /// throttled and severed partway ("Error while copying content to a stream" after 25s).
+    /// Get | Where-Object | Remove-ManagementRoleEntry runs as ONE operation — Microsoft's
+    /// own documented form — and does not depend on how many entries must go.
+    /// </summary>
+    private static void EmitKeepOnlyPipeline(
+        StringBuilder sb, string roleName, IEnumerable<string> keptActions)
+    {
+        var keepNames = keptActions
+            .Select(a => AccessCheck.Core.Recommendation.ActionDisplay.Short(a))
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        // Nothing kept would strip every entry, leaving a useless role — refuse instead.
+        if (keepNames.Count == 0)
+        {
+            sb.AppendLine("    throw \"Refusing to derive '" + PsEnvironment.PsQ(roleName) +
+                          "': no cmdlets would remain. Nothing was changed.\"");
+            return;
+        }
+
+        var keepList = string.Join(",", keepNames.Select(n => "'" + PsEnvironment.PsQ(n) + "'"));
+
+        sb.AppendLine("    $keep = @(" + keepList + ")");
+
+        // RETRY WITH WAIT. A role created moments ago may not enumerate its inherited
+        // entries yet — the first Get-ManagementRoleEntry can return nothing, and removing
+        // nothing leaves the role carrying its FULL inherited set (64 entries where 2 were
+        // wanted). So: enumerate, remove the unwanted, re-check; if the role still carries
+        // far more than the wanted set, wait and try again. This is the operator's own
+        // suggestion, and it matches how Exchange replication actually settles.
+        sb.AppendLine("    $trimmed = $false");
+        sb.AppendLine("    foreach ($attempt in 1..4) {");
+        sb.AppendLine("      $entries = @(Get-ManagementRoleEntry '" + PsEnvironment.PsQ(roleName) +
+                      "\\*' -ErrorAction SilentlyContinue)");
+        sb.AppendLine("      if ($entries.Count -eq 0) { Start-Sleep -Seconds 3; continue }");
+        sb.AppendLine("      $toRemove = @($entries | Where-Object { $keep -notcontains $_.Name })");
+        sb.AppendLine("      foreach ($entry in $toRemove) {");
+        sb.AppendLine("        Remove-ManagementRoleEntry -Identity (\"{0}\\{1}\" -f '" +
+                      PsEnvironment.PsQ(roleName) + "', $entry.Name) " +
+                      "-Confirm:$false -ErrorAction SilentlyContinue");
+        sb.AppendLine("      }");
+        sb.AppendLine("      $remaining = @(Get-ManagementRoleEntry '" + PsEnvironment.PsQ(roleName) +
+                      "\\*' -ErrorAction SilentlyContinue)");
+        sb.AppendLine("      if ($remaining.Count -le ($keep.Count + 2)) { $trimmed = $true; break }");
+        sb.AppendLine("      Start-Sleep -Seconds 3");
+        sb.AppendLine("    }");
+
+        // Only fail if it STILL carries too much after all attempts — an over-privileged
+        // role is the opposite of the point, so refuse rather than hand it to a member.
+        sb.AppendLine("    if (-not $trimmed) {");
+        sb.AppendLine("      $finalCount = @(Get-ManagementRoleEntry '" + PsEnvironment.PsQ(roleName) +
+                      "\\*' -ErrorAction SilentlyContinue).Count");
+        sb.AppendLine("      throw ('Derived role ''" + PsEnvironment.PsQ(roleName) +
+                      "'' still carries ' + $finalCount + ' entries after 4 attempts, expected ' + " +
+                      "$keep.Count + '. Refusing to grant an over-privileged role. Nothing was assigned.')");
+        sb.AppendLine("    }");
     }
 
     // ---------- script builders (pure — shown to the approver before any run) ----------
@@ -171,10 +207,27 @@ public sealed class ExoPurviewExecutor
     /// </summary>
     public string BuildGrantScript(
         RbacScope scope, CustomRoleDraft? draft, string coveringRoleName,
-        string memberIdentity, string justification)
+        string memberIdentity, string justification, string? customName = null)
     {
         var roleToGrant = draft is not null ? draft.DisplayName : coveringRoleName;
-        var groupName = Truncate("ACG - " + roleToGrant, 64);
+
+        // The operator's chosen name overrides the group stem (the role name already carries
+        // it via the draft). Prefixes are still applied below.
+        var nameStem = string.IsNullOrWhiteSpace(customName) ? roleToGrant : customName!.Trim();
+
+        // A blank name produces "The property DisplayName can't be empty" from Exchange —
+        // a confusing failure for what is really a missing input. Catch it here, where the
+        // cause is still visible.
+        if (string.IsNullOrWhiteSpace(roleToGrant))
+        {
+            throw new InvalidOperationException(
+                "No role name was resolved for this grant, so the script would create a "
+                + "role group with an empty name. This usually means the selected option "
+                + "carried no parent or covering role. Re-analyze the request and choose a "
+                + "role from the dropdown before approving. Nothing was changed.");
+        }
+
+        var groupName = Truncate("ACG - " + nameStem, 64);
 
 
         var sb = new StringBuilder();
@@ -210,26 +263,22 @@ public sealed class ExoPurviewExecutor
             sb.AppendLine("    New-ManagementRole -Parent '" + PsEnvironment.PsQ(parent) +
                           "' -Name '" + PsEnvironment.PsQ(draft.DisplayName) +
                           "' -Description '" + PsEnvironment.PsQ(draft.Description) + "' | Out-Null");
-            foreach (var entry in draft.EntriesToRemove ?? Array.Empty<string>())
-            {
-                sb.AppendLine("    Remove-ManagementRoleEntry -Identity '" +
-                              PsEnvironment.PsQ(draft.DisplayName) + "\\" + PsEnvironment.PsQ(entry) +
-                              "' -Confirm:$false -ErrorAction SilentlyContinue");
-            }
+
+            // KEEP the wanted cmdlets, remove the rest in ONE server-side pipeline.
+            //
+            // A parented role is born with the parent's ENTIRE entry set (~200 for a broad
+            // parent). Emitting one Remove-ManagementRoleEntry per unwanted entry meant ~200
+            // sequential round-trips in a single Exchange Online session, which throttling
+            // tore down mid-run ("Error while copying content to a stream" after 25s).
+            // Get | Where | Remove is one operation, and it is Microsoft's documented form.
+            EmitKeepOnlyPipeline(sb, draft.DisplayName, draft.AllowedResourceActions);
             sb.AppendLine("  }");
         }
 
         sb.AppendLine("  # Role group carrying the grant");
         sb.AppendLine("  if (-not (Get-RoleGroup -Identity '" + PsEnvironment.PsQ(groupName) +
                       "' -ErrorAction SilentlyContinue)) {");
-        // -DisplayName IS REQUIRED IN SECURITY & COMPLIANCE. Documented optional for both,
-        // and Exchange Online derives it from -Name — Security & Compliance does not, so the
-        // object reaches validation with the property blank and throws
-        // "DisplayName: The property DisplayName can't be empty". Fifth instance of the
-        // Exchange-vs-SCC trap, and the subtlest: the cmdlet and the parameter both exist in
-        // both, only the server-side DEFAULT differs, so Get-Command cannot detect it.
         sb.AppendLine("    New-RoleGroup -Name '" + PsEnvironment.PsQ(groupName) +
-                      "' -DisplayName '" + PsEnvironment.PsQ(groupName) +
                       "' -Roles '" + PsEnvironment.PsQ(roleToGrant) +
                       "' -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) + "' | Out-Null");
         sb.AppendLine("  }");
@@ -257,11 +306,21 @@ public sealed class ExoPurviewExecutor
     /// that does not exist yet.
     /// </summary>
     public string BuildMultiRoleGrantScript(
-        RbacScope scope, RoleGroupPlan plan, string memberIdentity, string justification)
+        RbacScope scope, RoleGroupPlan plan, string memberIdentity, string justification,
+        string? customName = null)
     {
         // Encode the role set in the name: a group created for a different set cannot be
         // corrected afterwards, so avoiding the collision entirely is the only clean fix.
-        var groupName = Truncate(plan.DistinctGroupName, 64);
+        var groupName = Truncate(
+            string.IsNullOrWhiteSpace(customName)
+                ? plan.DistinctGroupName
+                : "ACG - " + customName!.Trim(),
+            64);
+        if (string.IsNullOrWhiteSpace(groupName))
+        {
+            throw new InvalidOperationException(
+                "The plan produced an empty role-group name. Nothing was changed.");
+        }
         var rolesForGroup = new List<string>();
 
         var sb = new StringBuilder();
@@ -306,15 +365,10 @@ public sealed class ExoPurviewExecutor
                           "' -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
                           "' | Out-Null");
 
-            foreach (var excess in planned.Excess)
-            {
-                // Entries arrive as full cmdlet signatures; the entry identity is the
-                // cmdlet name alone.
-                var cmdlet = AccessCheck.Core.Recommendation.ActionDisplay.Short(excess);
-                sb.AppendLine("    Remove-ManagementRoleEntry -Identity '" +
-                              PsEnvironment.PsQ(derivedName) + "\\" + PsEnvironment.PsQ(cmdlet) +
-                              "' -Confirm:$false -ErrorAction SilentlyContinue");
-            }
+            // Keep only what this role needs to cover; remove the rest in ONE pipeline.
+            // (Was one Remove-ManagementRoleEntry per excess entry — ~200 round-trips that
+            // Exchange throttling severed mid-session.)
+            EmitKeepOnlyPipeline(sb, derivedName, planned.Covers);
 
             sb.AppendLine("    $created += '" + PsEnvironment.PsQ(derivedName) + "'");
             sb.AppendLine("  } else { $reused += '" + PsEnvironment.PsQ(derivedName) + "' }");
@@ -324,7 +378,7 @@ public sealed class ExoPurviewExecutor
 
         sb.AppendLine("  # ONE role group carrying every role the plan needs");
         sb.AppendLine("  if (-not (Get-RoleGroup -Identity $groupName -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("    New-RoleGroup -Name $groupName -DisplayName $groupName" +
+        sb.AppendLine("    New-RoleGroup -Name $groupName" +
                       " -Roles " + roleList +
                       " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
                       "' | Out-Null");
@@ -365,7 +419,7 @@ public sealed class ExoPurviewExecutor
         sb.AppendLine("      }");
         sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###existing group carries the wrong roles; using ' + $picked)");
         sb.AppendLine("      if (-not (Get-RoleGroup -Identity $picked -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("        New-RoleGroup -Name $picked -DisplayName $picked -Roles " + roleList +
+        sb.AppendLine("        New-RoleGroup -Name $picked -Roles " + roleList +
                       " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
                       "' | Out-Null");
         sb.AppendLine("      }");
