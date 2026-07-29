@@ -1,4 +1,4 @@
-namespace AccessCheck.Core.Recommendation;
+﻿namespace AccessCheck.Core.Recommendation;
 
 /// <summary>
 /// Does the proposal actually DO what the request asked?
@@ -68,9 +68,21 @@ public static class CapabilityCoverage
          new[] { "export", "download", "extract", "pst" },
          new[] { "export", "download", "alltasks", "manage" }),
 
+        // MEMBER IS THE WORD THE PERMISSIONS ACTUALLY USE. Nothing in Microsoft's
+        // vocabulary for managing membership says "assign" or "grant" — it says
+        // Add-DistributionGroupMember, Add-RoleGroupMember, groups/members/update, and the
+        // descriptions say "add a single recipient to distribution groups". So a request to
+        // manage membership, answered with precisely the three cmdlets that manage it, was
+        // reported as unable to do it.
+        //
+        // This only became a confident finding once the cmdlet descriptions were imported:
+        // before, the same mismatch surfaced as an UNCONFIRMED note, which was wrong but
+        // said so. A guard that is certain and wrong is worse than one that is uncertain
+        // and wrong, because the uncertain one invites the check that would correct it.
         ("assign or grant",
          new[] { "assign", "grant", "give access", "add to group", "membership" },
-         new[] { "assign", "grant", "membership", "alltasks", "manage" })
+         new[] { "assign", "grant", "membership", "member", "members",
+                 "alltasks", "manage" })
     };
 
     /// <summary>

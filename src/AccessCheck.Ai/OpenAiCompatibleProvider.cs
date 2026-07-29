@@ -6,7 +6,7 @@ namespace AccessCheck.Ai;
 
 /// <summary>
 /// Transport for any OpenAI-compatible /chat/completions endpoint: OpenAI itself,
-/// the org GenAI gateway, Ollama's OpenAI mode, Groq, and similar. Auth header is
+/// the org AI gateway, Ollama's OpenAI mode, Groq, and similar. Auth header is
 /// configurable (Authorization: Bearer by default; gateways with bare api-key
 /// headers set AuthHeaderName/AuthValuePrefix accordingly).
 /// </summary>

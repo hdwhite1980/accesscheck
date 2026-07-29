@@ -1,0 +1,9 @@
+Compliance Analyst
+
+Responsibilities:
+- Reviews every Conditional Access policy the organisation has configured and
+  reports on gaps against the security baseline.
+- Monitors sign-in logs and produces monthly reporting on risky sign-ins.
+- Audits guest user accounts and reports those that have been inactive for
+  more than ninety days.
+- Updates the documented exception register when an exception is approved.

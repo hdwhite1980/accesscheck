@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using AccessCheck.Core.Catalog;
 
 namespace AccessCheck.Graph;
@@ -66,8 +66,32 @@ public sealed class CatalogSync
         _ => "the matching RoleManagement permission"
     };
 
+    /// <summary>
+    /// Syncs every Graph provider, MERGING into <paramref name="existing"/> rather than
+    /// replacing it.
+    ///
+    /// The old behaviour built a fresh catalog and called ReplaceAll, which silently
+    /// destroyed everything Graph does not supply:
+    ///
+    ///   PURVIEW AND AZURE are not in Sources at all. They vanished outright.
+    ///
+    ///   EXCHANGE is worse, because it looks like it worked. The Graph endpoint returns
+    ///   Exchange role NAMES with EMPTY action lists; the cmdlets come from the PowerShell
+    ///   deep sync. So a routine Graph sync overwrote fully-populated Exchange roles with
+    ///   empty shells, and the catalog then held plenty of Exchange roles granting nothing.
+    ///
+    /// That is not hypothetical. A mailbox-delegation request answered correctly with
+    /// Add-MailboxFolderPermission at 20:56 was answered with
+    /// microsoft.backup/restorePoints/... at 23:29, because in between a Graph sync had
+    /// emptied the Exchange vocabulary and the only remaining action whose NAME contained
+    /// "mailbox" was a backup permission.
+    ///
+    /// SyncFreshness exists precisely so the two cadences can differ — Graph cheap and
+    /// frequent, PowerShell expensive and weekly. ReplaceAll made that impossible.
+    /// </summary>
     public async Task<(RoleCatalog Catalog, IReadOnlyList<ProviderSyncResult> Results)> SyncAllAsync(
-        Action<string>? progress = null, CancellationToken ct = default)
+        Action<string>? progress = null, CancellationToken ct = default,
+        RoleCatalog? existing = null)
     {
         var roles = new List<RoleDefinitionRecord>();
         var results = new List<ProviderSyncResult>();
@@ -107,8 +131,72 @@ public sealed class CatalogSync
         }
 
         var catalog = new RoleCatalog();
-        catalog.ReplaceAll(roles, DateTimeOffset.UtcNow);
+        catalog.ReplaceAll(Merge(existing, roles, results), DateTimeOffset.UtcNow);
+
+        // Per-source sync times survive the merge. Overwriting them would report
+        // PowerShell data as fresh because Graph ran, which is the reverse of what the
+        // freshness display is for.
+        if (existing is not null) catalog.Freshness = existing.Freshness;
+
         return (catalog, results);
+    }
+
+    /// <summary>
+    /// Combines what Graph just returned with what the previous catalog held.
+    ///
+    /// Two rules, and both exist because a provider being absent from this sync says
+    /// nothing about whether its data is still good:
+    ///
+    /// 1. A provider this sync did not SUCCESSFULLY read is carried over untouched. That
+    ///    covers providers Graph does not serve (Purview, Azure) and providers that failed
+    ///    this time — a 403 from a transient consent problem must not also erase roles that
+    ///    were read successfully an hour ago.
+    ///
+    /// 2. Within a provider that WAS read, an incoming role carrying NO actions never
+    ///    displaces a stored role of the same id that has some. This is the Exchange case:
+    ///    Graph knows the role exists, only PowerShell knows what is in it, and an empty
+    ///    list is missing information rather than a role that grants nothing.
+    /// </summary>
+    private static List<RoleDefinitionRecord> Merge(
+        RoleCatalog? existing,
+        List<RoleDefinitionRecord> incoming,
+        List<ProviderSyncResult> results)
+    {
+        if (existing is null || existing.Roles.Count == 0) return incoming;
+
+        var readSuccessfully = results
+            .Where(r => r.Error is null)
+            .Select(r => r.Provider)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var incomingById = new Dictionary<string, RoleDefinitionRecord>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var r in incoming) incomingById[r.Id] = r;
+
+        var merged = new List<RoleDefinitionRecord>(incoming);
+
+        foreach (var stored in existing.Roles)
+        {
+            // Rule 1 - provider untouched by this sync.
+            if (!readSuccessfully.Contains(stored.Provider))
+            {
+                if (!incomingById.ContainsKey(stored.Id)) merged.Add(stored);
+                continue;
+            }
+
+            // Rule 2 - do not let an empty incoming role hollow out a populated stored one.
+            if (!incomingById.TryGetValue(stored.Id, out var fresh)) continue;
+            if (fresh.AllowedResourceActions.Count > 0) continue;
+            if (stored.AllowedResourceActions.Count == 0) continue;
+
+            merged.Remove(fresh);
+            // Keep the freshly-read metadata and restore the permissions only. A name or
+            // description may legitimately have changed; the empty action list is the only
+            // part that is wrong.
+            merged.Add(fresh with { AllowedResourceActions = stored.AllowedResourceActions });
+        }
+
+        return merged;
     }
 
     private static string Explain(string provider, Exception? ex)

@@ -1,4 +1,4 @@
-using AccessCheck.Core.Catalog;
+﻿using AccessCheck.Core.Catalog;
 
 namespace AccessCheck.Core.Recommendation;
 
@@ -21,9 +21,29 @@ public sealed record PlannedRole
 
     /// <summary>Set by the planner from the provider's capability.</summary>
     public bool CanDerive { get; init; } = true;
-    public int ExcessRiskScore => ActionRisk.Score(Excess);
 
-    public string Summary => NeedsDerivation
+    /// <summary>
+    /// True when this entry IS a role rather than a bundle of cmdlets.
+    ///
+    /// Purview exposes role names and nothing inside them — Get-ManagementRoleEntry does
+    /// not exist in that session and Get-ManagementRole returns an empty RoleEntries. So
+    /// the granular unit there is the ROLE, and Covers holds the role's own name. Excess
+    /// is always empty: a role cannot over-grant relative to itself, and the real
+    /// over-privilege question is which built-in role GROUP you would otherwise have used.
+    /// </summary>
+    public bool IsRoleLevel { get; init; }
+
+    /// <summary>Microsoft's description of the role, where the vocabulary is role-level.</summary>
+    public string Description { get; init; } = "";
+
+    // Scoring cmdlet names is meaningful; scoring role names is not — ActionRisk reads
+    // action shapes, and "Search And Purge" is not one.
+    public int ExcessRiskScore => IsRoleLevel ? 0 : ActionRisk.Score(Excess);
+
+    public string Summary => IsRoleLevel
+        ? $"include role '{RoleName}'"
+          + (Description.Length == 0 ? "" : " — " + Description)
+        : NeedsDerivation
         ? $"derive from '{RoleName}' (supplies {Covers.Count}, strips {Excess.Count} excess)"
         : Excess.Count == 0
             ? $"use '{RoleName}' as-is (supplies {Covers.Count}, no excess)"
@@ -82,6 +102,27 @@ public sealed record RoleGroupPlan
     /// <summary>Required cmdlets no role in this service supplies.</summary>
     public required IReadOnlyList<string> Uncovered { get; init; }
 
+    /// <summary>
+    /// True when this plan grants ROLES rather than cmdlets. Purview only.
+    /// </summary>
+    public bool RoleLevel { get; init; }
+
+    /// <summary>
+    /// The narrowest built-in role group that already carries everything this plan needs,
+    /// and how many EXTRA roles it would also hand over.
+    ///
+    /// This is the over-privilege figure for a role-level service, and it is a different
+    /// measurement from the cmdlet-level one — extra ROLES, not extra actions. Without it
+    /// a Purview verdict had no delta at all and read as "zero excess", which is exactly
+    /// the reassurance PermissionBreadth exists to stop the app giving.
+    ///
+    /// Null means NO single built-in group covers the set. That is not "no excess": it
+    /// means the alternative is granting two groups, which is the strongest case for
+    /// composing one.
+    /// </summary>
+    public string? NarrowestAlternative { get; init; }
+    public int? AlternativeExcessRoles { get; init; }
+
     public bool IsComplete => Uncovered.Count == 0;
     public int TotalExcess => Roles.Sum(r => r.Excess.Count);
     public int TotalExcessRisk => Roles.Sum(r => r.ExcessRiskScore);
@@ -89,7 +130,23 @@ public sealed record RoleGroupPlan
     /// <summary>True when every role is used as-is because the service forbids derivation.</summary>
     public bool CompositionOnly => Roles.Count > 0 && Roles.All(r => !r.CanDerive);
 
-    public string Headline => IsComplete
+    public string Headline => RoleLevel ? RoleLevelHeadline : CmdletLevelHeadline;
+
+    private string RoleLevelHeadline => IsComplete
+        ? $"role group '{RoleGroupName}' carrying " +
+          (Roles.Count == 1 ? "1 role" : Roles.Count + " roles") +
+          (AlternativeExcessRoles is { } extra
+              ? extra == 0
+                  // The built-in already is the minimum. Composing adds an object to govern
+                  // and grants nothing less, so say so rather than manufacture a difference.
+                  ? $" — the same as built-in '{NarrowestAlternative}', which is already minimal"
+                  : $" — the narrowest built-in alternative is '{NarrowestAlternative}', which " +
+                    $"would also grant {extra} role(s) nobody asked for"
+              : " — NO single built-in role group carries this combination, so the " +
+                "alternative is granting two")
+        : $"INCOMPLETE — {Uncovered.Count} role(s) are not defined in this tenant";
+
+    private string CmdletLevelHeadline => IsComplete
         ? (Roles.Count == 1
             ? $"role group '{RoleGroupName}' carrying 1 role"
             : $"role group '{RoleGroupName}' carrying {Roles.Count} roles")
@@ -186,6 +243,85 @@ public sealed record RoleGroupPlan
         };
     }
 
+    /// <summary>
+    /// A plan for a service whose vocabulary is ROLES, not cmdlets. Purview only.
+    ///
+    /// Build() cannot work here and never could: it set-covers over
+    /// AllowedResourceActions, and Purview roles carry none. The tenant reports 120 roles
+    /// and nothing about their contents, because the Security and Compliance session has
+    /// no Get-ManagementRoleEntry and Get-ManagementRole returns an empty RoleEntries. Set
+    /// cover over empty sets covers nothing, so every Purview request fell through to
+    /// another service — a phishing purge came back with Remove-Mailbox, which deletes the
+    /// mailbox rather than the message.
+    ///
+    /// Chasing those cmdlets was the wrong goal anyway. Purview cannot create custom
+    /// management roles, so nothing is ever derived or stripped and a cmdlet list could
+    /// not be acted on even if it existed. The unit of granting IS the role.
+    ///
+    /// VALIDATION STILL HOLDS. A proposed role must appear in the tenant's own role list
+    /// or it is Uncovered — the same rule as an unknown action, applied to the only
+    /// vocabulary this service publishes. A model cannot invent a role here any more than
+    /// it can invent an action elsewhere.
+    ///
+    /// OVER-PRIVILEGE IS MEASURED IN ROLES. Microsoft publishes which built-in role groups
+    /// carry each role, so the narrowest of those is the alternative an operator would
+    /// otherwise use, and its surplus roles are the saving. That is a real delta from a
+    /// documented source, in place of the "unknown" this service used to report.
+    /// </summary>
+    public static RoleGroupPlan BuildFromRoles(
+        PurviewRoleCatalog docs,
+        IReadOnlyCollection<string> tenantRoleNames,
+        IReadOnlyCollection<string> wantedRoles,
+        string roleGroupName)
+    {
+        var tenant = new HashSet<string>(tenantRoleNames, StringComparer.OrdinalIgnoreCase);
+
+        var known = wantedRoles
+            .Where(r => tenant.Contains(r))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var unknown = wantedRoles
+            .Where(r => !tenant.Contains(r))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var planned = known.Select(name => new PlannedRole
+        {
+            RoleId = name,
+            RoleName = name,
+            IsRoleLevel = true,
+            CanDerive = false,
+            Description = docs.Find(name)?.Description ?? "",
+            Covers = new[] { name },
+            // A role cannot over-grant relative to itself. The real question is which
+            // built-in group you would otherwise have used, answered below.
+            Excess = Array.Empty<string>()
+        }).ToList();
+
+        var narrowest = known.Count == 0
+            ? null
+            : docs.RoleGroups
+                .Where(g => known.All(k =>
+                    g.Roles.Any(r => r.Equals(k, StringComparison.OrdinalIgnoreCase))))
+                .OrderBy(g => g.Roles.Count)
+                .FirstOrDefault();
+
+        return new RoleGroupPlan
+        {
+            Provider = RbacProviders.Purview,
+            RoleGroupName = roleGroupName,
+            RoleLevel = true,
+            Roles = planned,
+            Uncovered = unknown,
+            NarrowestAlternative = narrowest?.Name,
+            AlternativeExcessRoles = narrowest is null
+                ? null : narrowest.Roles.Count - known.Count
+        };
+    }
+
     /// <summary>Human-readable plan for the approval screen and the audit record.</summary>
     public string Describe()
     {
@@ -198,6 +334,9 @@ public sealed record RoleGroupPlan
         foreach (var role in Roles)
         {
             lines.Add("  " + role.Summary);
+            // A role-level entry's Covers is its own name, already shown in the summary.
+            // Repeating it as "supplies:" reads as though the role contained one cmdlet.
+            if (role.IsRoleLevel) { lines.Add(""); continue; }
             foreach (var cmdlet in role.Covers.Take(10))
                 lines.Add("      supplies: " + ActionDisplay.Short(cmdlet));
             if (role.Excess.Count > 0)
@@ -210,13 +349,26 @@ public sealed record RoleGroupPlan
             lines.Add("");
         }
 
+        if (RoleLevel && AlternativeExcessRoles is { } surplus && surplus > 0
+            && NarrowestAlternative is not null)
+        {
+            lines.Add("Narrowest built-in alternative: '" + NarrowestAlternative + "', which "
+                    + "would also grant " + surplus + " role(s) this plan does not.");
+            lines.Add("");
+        }
+
         if (!IsComplete)
         {
-            lines.Add("NOT COVERED by any role in this service:");
+            lines.Add(RoleLevel
+                ? "NOT DEFINED in this tenant:"
+                : "NOT COVERED by any role in this service:");
             foreach (var cmdlet in Uncovered) lines.Add("  " + ActionDisplay.Short(cmdlet));
             lines.Add("");
-            lines.Add("Granting this plan would leave the task partly undone. Check the "
-                    + "service is correct before proceeding.");
+            lines.Add(RoleLevel
+                ? "These role names are not in your tenant's synced Purview role list and "
+                + "were rejected. Nothing was substituted."
+                : "Granting this plan would leave the task partly undone. Check the "
+                + "service is correct before proceeding.");
         }
 
         return string.Join(Environment.NewLine, lines);

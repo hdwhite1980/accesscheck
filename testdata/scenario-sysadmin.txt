@@ -1,0 +1,24 @@
+Systems Administrator - Microsoft 365
+
+Purpose of the role:
+The Systems Administrator is responsible for the day to day operation and
+administration of the organisation's Microsoft 365 environment.
+
+Key responsibilities:
+- Creates, amends and disables user accounts as part of the joiners, movers
+  and leavers process.
+- Resets passwords and re-registers multi-factor authentication methods for
+  staff who have lost access to their devices.
+- Manages membership of distribution lists and Microsoft 365 groups.
+- Delegates access to mailboxes when a member of staff is on extended leave,
+  and removes that access on their return.
+- Configures and deploys device compliance policies in Intune and monitors
+  the resulting compliance reporting.
+- Enrols and retires corporate mobile devices.
+- Produces monthly reporting on licence allocation and consumption.
+- Investigates and responds to reported phishing emails, including searching
+  for and removing malicious messages from mailboxes across the tenant.
+- Maintains the organisation's data loss prevention policies.
+- Acts as an escalation point for the service desk and participates in the
+  out of hours on-call rota.
+- Liaises with third party suppliers on support contracts and licensing.

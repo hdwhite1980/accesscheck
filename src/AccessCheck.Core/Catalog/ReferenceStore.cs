@@ -38,6 +38,25 @@ public sealed class ReferenceStore
             .ToDictionary(g => g.Key, g => g.First().IsPrivileged!.Value,
                           StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Microsoft's DESCRIPTIONS, keyed by action name — the input to
+    /// ActionRisk.UseDescriptions.
+    ///
+    /// Deliberately a sibling of <see cref="StatedPrivilege"/> rather than something the
+    /// caller assembles inline: both feed ActionRisk, both must skip empty values, and both
+    /// must survive duplicate names. Having only one of them here is why the description
+    /// correction was easy to wire up and easy to forget.
+    ///
+    /// Empty descriptions are dropped rather than stored blank. ActionRisk treats a blank
+    /// description as "no opinion" anyway, and carrying them inflates DescribedCount into
+    /// claiming coverage the app does not have.
+    /// </summary>
+    public Dictionary<string, string> Descriptions() =>
+        Entries.Where(e => !string.IsNullOrWhiteSpace(e.Description))
+            .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().Description,
+                          StringComparer.OrdinalIgnoreCase);
+
     public static ReferenceStore Load(string path)
     {
         if (!File.Exists(path)) return new ReferenceStore();

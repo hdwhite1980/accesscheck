@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -7,4 +7,15 @@
     <!-- TRUST BOUNDARY: Core has ZERO UI, Graph, or AI dependencies.
          All verdicts (validation, set-cover, delta) are deterministic and testable here. -->
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The candidate scorer's matching rules are implementation detail, but they decide
+         what the model is ever ALLOWED to pick — and nothing downstream can recover a
+         permission that was never shown. A fault there is invisible to the validator, the
+         guards and the verifier alike, and surfaces only as a plausible wrong answer:
+         "users" matched agentUsers as strongly as users, and three duties in one run came
+         back proposing permissions on the wrong object type.
+         Testable without being public API is exactly what this attribute is for. -->
+    <InternalsVisibleTo Include="AccessCheck.Core.Tests" />
+  </ItemGroup>
 </Project>

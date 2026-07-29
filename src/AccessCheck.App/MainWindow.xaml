@@ -203,7 +203,7 @@
                     <StackPanel Margin="14" MaxWidth="1050">
                         <TextBlock Style="{StaticResource H1}" Text="Describe the function the user needs to perform"/>
                         <TextBlock Style="{StaticResource Hint}"
-                                   Text="Plain English. The GenAI endpoint sees only this text plus role names and action lists from your synced catalog — never a username or tenant ID. Its suggestion is then validated deterministically: unknown actions are rejected, covering roles are ranked by over-privilege delta per service."/>
+                                   Text="Plain English. The AI endpoint sees only this text plus role names and action lists from your synced catalog — never a username or tenant ID. Its suggestion is then validated deterministically: unknown actions are rejected, covering roles are ranked by over-privilege delta per service."/>
                         <TextBox x:Name="FunctionText" Margin="0,10,0,8" Height="64"
                                  TextWrapping="Wrap" AcceptsReturn="True"
                                  FontSize="14"/>
@@ -212,7 +212,7 @@
                             <TextBlock Text="Service" Margin="14,7,0,0" Style="{StaticResource Hint}"/>
                             <ComboBox x:Name="ForcedProviderBox" Width="210" Margin="6,0,0,0"
                                       ToolTip="Which service owns this feature. Auto-detect asks the model, which is the judgement it gets wrong most often — naming it yourself removes that risk entirely."/>
-                            <CheckBox x:Name="UseDemoCheck" Content="Offline demo suggester (no GenAI call)"
+                            <CheckBox x:Name="UseDemoCheck" Content="Offline demo suggester (no AI call)"
                                       Margin="16,6,0,0"/>
                         </StackPanel>
 
@@ -329,6 +329,38 @@
                                         HorizontalAlignment="Left"/>
                             </StackPanel>
                         </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ================= JOB DESCRIPTION ================= -->
+            <TabItem Header="Job Description">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="14" MaxWidth="1050">
+                        <TextBlock Style="{StaticResource H1}" Text="Analyse a whole job description"/>
+                        <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap"
+                                   Text="Paste a role profile or a list of duties. It is split into discrete duties first, and each one runs through the ordinary pipeline on its own — its own service, its own permissions, its own guards. That split is the point: a page of text is not one request, and answering it as one produces a role that covers everything and grants far too much."/>
+                        <TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,6,0,0"
+                                   Text="The result is a PORTFOLIO, not a role. Some duties deserve standing access, some a time-boxed grant, some should be requested per incident, and some are not access questions at all. A single role covering every duty on a systems administrator's job description is approximately Global Administrator."/>
+
+                        <TextBox x:Name="JdText" Margin="0,10,0,8" Height="220"
+                                 TextWrapping="Wrap" AcceptsReturn="True"
+                                 VerticalScrollBarVisibility="Auto"
+                                 FontFamily="Consolas" FontSize="13"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,14">
+                            <Button x:Name="JdAnalyzeButton" Content="Split &amp; analyse"
+                                    Click="JdAnalyze_Click"/>
+                            <Button x:Name="JdLoadButton" Content="Load from file..."
+                                    Click="JdLoad_Click" Margin="10,0,0,0"/>
+                            <Button x:Name="JdCopyButton" Content="Copy plan"
+                                    Click="JdCopy_Click" Margin="10,0,0,0" IsEnabled="False"/>
+                            <TextBlock x:Name="JdStatus" Margin="14,7,0,0"
+                                       Style="{StaticResource Hint}"/>
+                        </StackPanel>
+
+                        <StackPanel x:Name="JdPlanPanel"/>
+                        <StackPanel x:Name="JdDutyPanel"/>
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>
@@ -790,7 +822,7 @@
                             <TextBox x:Name="ExcessBox" Grid.Row="3" Grid.Column="1" Margin="0,4" Text="5"/>
                         </Grid>
 
-                        <TextBlock Style="{StaticResource H1}" Text="GenAI endpoint" Margin="0,16,0,8"/>
+                        <TextBlock Style="{StaticResource H1}" Text="AI Endpoint" Margin="0,16,0,8"/>
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="200"/><ColumnDefinition Width="*"/>
@@ -837,7 +869,7 @@
                         </StackPanel>
 
                         <TextBlock Style="{StaticResource Hint}" Margin="0,18,0,0"
-                                   Text="Sign-in is interactive (MSAL public client, delegated) — every Graph write is attributed to your admin account in the Entra audit log. The GenAI key and sign-in token cache are DPAPI-encrypted per user. Prompts sent to the GenAI endpoint are logged verbatim to prompt-log.txt in the AccessCheck data folder."/>
+                                   Text="Sign-in is interactive (MSAL public client, delegated) — every Graph write is attributed to your admin account in the Entra audit log. The AI key and sign-in token cache are DPAPI-encrypted per user. Prompts sent to the AI endpoint are logged verbatim to prompt-log.txt in the AccessCheck data folder."/>
                     </StackPanel>
                 </ScrollViewer>
             </TabItem>

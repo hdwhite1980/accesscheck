@@ -4,7 +4,7 @@ using AccessCheck.Core.Recommendation;
 namespace AccessCheck.Cli;
 
 /// <summary>
-/// Offline stand-in for the GenAI endpoint so the full pipeline
+/// Offline stand-in for the AI endpoint so the full pipeline
 /// (suggest -> validate -> approve -> plan) can be exercised with no network.
 /// Naive keyword matching against catalog action strings — deliberately dumb,
 /// because the validator is what makes the pipeline safe, not the suggester.
@@ -37,7 +37,7 @@ public sealed class DemoProvider : IRecommendationProvider
         {
             RequiredActions = matched,
             Reasoning = "DEMO provider: keyword match on '" + functionDescription +
-                        "'. Replace with the GenAI endpoint for real analysis."
+                        "'. Replace with the AI endpoint for real analysis."
         });
     }
 }

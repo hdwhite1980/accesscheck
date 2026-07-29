@@ -1,4 +1,4 @@
-using AccessCheck.Core.Catalog;
+﻿using AccessCheck.Core.Catalog;
 
 namespace AccessCheck.Core.Recommendation;
 
@@ -636,6 +636,51 @@ public sealed class RecommendationValidator
     /// Truncating the request produced tenant objects called "AC - I need access to use",
     /// which is meaningless in an audit six months later.
     /// </summary>
+    /// <summary>
+    /// Segments that say nothing about WHICH capability a permission is — they qualify how
+    /// much of a resource is reached, not what is done to it, and every resource has them.
+    /// Including them would make "users basic" and "users standard" look like different
+    /// capabilities when they are the same one at different breadths.
+    /// </summary>
+    private static readonly string[] GenericQualifiers =
+    {
+        "basic", "standard", "allproperties", "alltasks", "allentities", "limitedread"
+    };
+
+    /// <summary>
+    /// The capability inside a resource — the segments between the resource and the verb.
+    ///
+    /// microsoft.directory/users/authenticationMethods/create
+    ///   resource = users, capability = authenticationMethods, verb = create
+    ///
+    /// Naming from the resource alone produced three different roles all called
+    /// "AC - Entra ID manage users": one that creates accounts, one that amends licence and
+    /// location, and one that deletes and re-creates authentication methods. They are
+    /// genuinely different grants, correctly kept apart by the planner, and then handed the
+    /// same name — which collides in the tenant, and a role group's contents cannot be
+    /// changed after creation, so the collision is unfixable in place.
+    ///
+    /// The capability segment is what actually distinguishes them, and it is also what an
+    /// auditor needs six months later: "manage users authenticationMethods" says what the
+    /// role does in a way "manage users" does not.
+    /// </summary>
+    private static IEnumerable<string> Capabilities(string action)
+    {
+        // Cmdlets have no path shape — Add-MailboxFolderPermission is already specific.
+        var slash = action.IndexOf('/');
+        if (slash < 0) yield break;
+
+        var parts = action[(slash + 1)..]
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        // First segment is the resource, last is the verb. Everything between is capability.
+        for (var i = 1; i < parts.Length - 1; i++)
+        {
+            if (GenericQualifiers.Contains(parts[i], StringComparer.OrdinalIgnoreCase)) continue;
+            yield return parts[i];
+        }
+    }
+
     private static string BuildCustomRoleName(
         string functionDescription, string provider, IReadOnlyList<string> actions)
     {
@@ -653,6 +698,16 @@ public sealed class RecommendationValidator
         var what = subjects.Count == 0
             ? actions.Count + " permission(s)"
             : string.Join(" + ", subjects);
+
+        // Two capabilities at most. Beyond that the name stops being readable and the
+        // action list on the approval screen is the better place to look anyway.
+        var capabilities = actions
+            .SelectMany(Capabilities)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(2)
+            .ToList();
+        if (capabilities.Count > 0) what += " " + string.Join(" + ", capabilities);
+
         var service = RbacProviders.DisplayName(provider).Split(" (")[0];
 
         return Truncate($"AC - {service} {verb} {what}", 120);

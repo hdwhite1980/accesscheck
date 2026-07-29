@@ -1,0 +1,8 @@
+Service Desk Team Leader
+
+Responsibilities:
+- Manages membership of security groups across the organisation, adding and
+  removing staff as they join, move between teams, and leave.
+- Resets user passwords and unlocks accounts for staff who contact the service desk.
+- Monitors device compliance reports and produces a weekly summary for the IT manager.
+- Chairs the weekly service desk stand-up and mentors two junior analysts.

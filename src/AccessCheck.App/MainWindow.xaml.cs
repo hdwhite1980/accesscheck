@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -9,6 +9,7 @@ using AccessCheck.Core.Config;
 using AccessCheck.Core.Execution;
 using AccessCheck.Core.Groups;
 using AccessCheck.Core.Recommendation;
+using Microsoft.Win32;
 using AccessCheck.Core.Review;
 using AccessCheck.Graph;
 using AccessCheck.PowerShell;
@@ -90,7 +91,22 @@ public partial class MainWindow : Window
         _referenceStore = ReferenceStore.Load(ReferencePath);
         _cmdletCapabilities = CmdletCapabilityStore.Load(CmdletCapabilityPath);
         _ineligibility = CustomRoleEligibility.Load(IneligibilityPath);
+        // BEFORE ActionRisk READS IT. Exchange and Purview cmdlets carry no description
+        // from any API — Exchange Online's REST mode generates proxy cmdlets with no help
+        // content, so even Get-Help returns an empty synopsis. Merging afterwards would
+        // leave UseDescriptions, PermissionIndex, the guards and the verifier all looking
+        // at the description-less version.
+        var cmdletDocs = CmdletDescriptionStore.Load(CmdletDescriptionsPath);
+        if (!cmdletDocs.IsEmpty) cmdletDocs.MergeInto(_referenceStore, RbacProviders.Exchange);
+
         ActionRisk.UseAuthoritative(_referenceStore.StatedPrivilege());
+        // BOTH CORRECTIONS, NOT ONE. UseAuthoritative covers only actions where Microsoft
+        // STATES a privilege flag, and Intune states none for any action at all — so on
+        // that service the heuristic's "unknown shape: treat as privileged" default decided
+        // everything, rating View_reports as escalation-capable at six times a read's cost
+        // in every ranking decision. The descriptions are the only correction available
+        // there, and installing one without the other left it switched off.
+        ActionRisk.UseDescriptions(_referenceStore.Descriptions());
 
         if (File.Exists(CatalogPath))
         {
@@ -98,6 +114,8 @@ public partial class MainWindow : Window
             {
                 _catalog = RoleCatalog.Load(CatalogPath);
                 PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
+                // The built-in map covers a handful by hand; Microsoft publishes all 119.
+                PurviewRoleCatalog.Load(PurviewRolesPath).EnrichCatalog(_catalog);
                 RefreshCatalogGrid();
         RebuildPermissionCatalog();
         RefreshForcedProviderList();
@@ -1547,6 +1565,7 @@ public partial class MainWindow : Window
             // mapping. Fill in the well-known ones from Microsoft's documentation so the
             // service is usable — clearly labelled, and never overwriting tenant data.
             var enrichedPurview = PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
+            enrichedPurview += PurviewRoleCatalog.Load(PurviewRolesPath).EnrichCatalog(_catalog);
             if (enrichedPurview > 0)
             {
                 _lastSyncReport.Add("Purview: filled in " + enrichedPurview + " role(s) from "
@@ -2085,8 +2104,14 @@ public partial class MainWindow : Window
 
             var stated = _referenceStore.StatedPrivilege();
             ActionRisk.UseAuthoritative(stated);
+            // Re-installed here as well as at startup, so a fresh sync takes effect without
+            // restarting the app — matching what UseAuthoritative already does.
+            ActionRisk.UseDescriptions(_referenceStore.Descriptions());
             _lastSyncReport.Add("Risk ratings: " + stated.Count + " action(s) now use Microsoft's "
-                + "stated privilege level instead of this app's inference.");
+                + "stated privilege level instead of this app's inference. "
+                + ActionRisk.DescribedCount + " action(s) carry a description that can "
+                + "downgrade an over-cautious guess — the only correction available for "
+                + "Intune, which states no privilege flag at all.");
 
             RefreshReferenceProviderList();
             ApplyReferenceFilter();
@@ -2266,6 +2291,13 @@ public partial class MainWindow : Window
     /// <summary>Actions this tenant has refused to put in a custom role.</summary>
     private CustomRoleEligibility _ineligibility = new();
     private string IneligibilityPath => Path.Combine(_dataDir, "custom-role-ineligible.json");
+    /// <summary>Microsoft's published Purview role list. The Security and Compliance session
+    /// cannot report what a Purview role contains, so this is the only vocabulary it has.</summary>
+    private string PurviewRolesPath => Path.Combine(_dataDir, "purview-roles.json");
+    /// <summary>Exchange and Purview cmdlet descriptions. No API supplies these, and without
+    /// them the model reads names only — which is how a request to remove MESSAGES became
+    /// Remove-Mailbox, a cmdlet that deletes the mailbox and the user account with it.</summary>
+    private string CmdletDescriptionsPath => Path.Combine(_dataDir, "exchange-descriptions.json");
     private string CmdletCapabilityPath => Path.Combine(_dataDir, "cmdlet-capabilities.json");
     private string ReferencePath => Path.Combine(_dataDir, "reference.json");
 
@@ -2731,8 +2763,8 @@ public partial class MainWindow : Window
                 var key = SecretStore.Load(_config.Ai.ApiKeyName);
                 if (string.IsNullOrEmpty(key))
                     throw new InvalidOperationException(
-                        "No GenAI key stored — set it in Settings, or tick the offline demo box.");
-                Status("Asking GenAI endpoint (two-stage)...");
+                        "No AI key stored — set it in Settings, or tick the offline demo box.");
+                Status("Asking AI endpoint (two-stage)...");
                 using var provider = AiProviderFactory.Create(BuildAiConfig(), key);
                 provider.PromptLogger = (stage, prompt) =>
                     File.AppendAllText(PromptLogPath,
@@ -3016,14 +3048,14 @@ public partial class MainWindow : Window
         else if (UseDemoCheck.IsChecked == true ||
                  SecretStore.Load(_config.Ai.ApiKeyName) is null)
         {
-            body = "(Offline: no GenAI endpoint in use. The tenant facts above are " +
-                   "deterministic; configure the GenAI endpoint in Settings and untick " +
+            body = "(Offline: no AI endpoint in use. The tenant facts above are " +
+                   "deterministic; configure the AI endpoint in Settings and untick " +
                    "the demo box for a plain-language explanation of what this " +
                    "permission allows and its risk profile.)";
         }
         else
         {
-            Status("Asking GenAI to explain '" + action + "'...");
+            Status("Asking AI to explain '" + action + "'...");
             try
             {
                 _config = ReadConfigFromUi();
@@ -5214,20 +5246,32 @@ public partial class MainWindow : Window
                         using var resultDoc = await psExec.RunAsync(script);
                         var groupName = resultDoc.RootElement.TryGetProperty("roleGroup", out var g)
                             ? g.GetString() : null;
-                        var roleName = resultDoc.RootElement.TryGetProperty("role", out var rn)
-                            ? rn.GetString() : null;
-    
-                        // The multi-role script reads the group back and returns what it ACTUALLY
-                        // carries. Creation succeeding is an attempt; this is the result.
-                        if (multiRole && resultDoc.RootElement.TryGetProperty("roles", out var rolesEl)
+                        // BOTH PATHS REPORT WHAT THE TENANT ACTUALLY CARRIES.
+                        //
+                        // The single-role script used to echo back the role it was ASKED to
+                        // grant; it now reads the group and returns what is really in it, the
+                        // same as the multi-role path. Reading "roles" only when multiRole left
+                        // single-role grants with a null role name in the audit record — an
+                        // approved, executed Exchange grant whose record could not say which
+                        // role was involved.
+                        var landed = new List<string>();
+                        if (resultDoc.RootElement.TryGetProperty("roles", out var rolesEl)
                             && rolesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
                         {
-                            var landed = rolesEl.EnumerateArray()
+                            landed = rolesEl.EnumerateArray()
                                 .Select(e => e.GetString() ?? "")
                                 .Where(x => x.Length > 0).ToList();
-                            var wanted = plan!.Roles.Count;
+                        }
+                        var roleName = landed.Count > 0
+                            ? string.Join(" + ", landed)
+                            // Fallback for an older script shape, so a mid-upgrade run still
+                            // records something rather than silently nothing.
+                            : (resultDoc.RootElement.TryGetProperty("role", out var rn)
+                                ? rn.GetString() : null);
     
-                            roleName = string.Join(" + ", landed);
+                        if (multiRole && landed.Count > 0)
+                        {
+                            var wanted = plan!.Roles.Count;
                             Status("Role group '" + groupName + "' carries " + landed.Count
                                    + " of " + wanted + " planned role(s).");
     
@@ -5269,7 +5313,16 @@ public partial class MainWindow : Window
                             PermanentGrant = permanent,
                             ChosenRoleId = roleName, ChosenRoleDisplay = roleName,
                             CustomRoleCreated = draft is not null,
-                            GroupIdUsed = groupName, TrackedExpiryUtc = expires
+                            GroupIdUsed = groupName, TrackedExpiryUtc = expires,
+                            // THE DEDICATED FIELDS, POPULATED AT LAST. Both existed from the
+                            // start and were never written, so every Exchange and Purview
+                            // record carried its role group in GroupIdUsed — a field named for
+                            // Entra groups — and its role name only in ChosenRoleDisplay.
+                            // Anything reading history for "what did we create in Exchange"
+                            // had to parse prose. Housekeeping and grant reuse both need this
+                            // structured.
+                            ExoRoleGroup = groupName,
+                            ExoRoleName = roleName
                         });
                         continue;
                     }
@@ -6295,9 +6348,365 @@ public partial class MainWindow : Window
         RefreshHistoryGrid();
     }
 
+    // ================= JOB DESCRIPTION TAB =================
+
+    /// <summary>
+    /// The last plan, kept so "Copy plan" does not have to re-run the analysis.
+    /// </summary>
+    private PortfolioComposer.Portfolio? _jdPortfolio;
+
+    private void JdLoad_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "Open a job description",
+            Filter = "Text and Markdown (*.txt;*.md)|*.txt;*.md|All files (*.*)|*.*"
+        };
+        if (dialog.ShowDialog() != true) return;
+
+        try { JdText.Text = File.ReadAllText(dialog.FileName); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Could not read that file.\n\n" + ex.Message,
+                "Open failed", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void JdCopy_Click(object sender, RoutedEventArgs e)
+    {
+        if (_jdPortfolio is null) return;
+        try
+        {
+            Clipboard.SetText(PortfolioComposer.Describe(_jdPortfolio));
+            JdStatus.Text = "Plan copied to the clipboard.";
+        }
+        catch (Exception)
+        {
+            // Another process can hold the clipboard open. Not worth a dialog.
+            JdStatus.Text = "Could not access the clipboard.";
+        }
+    }
+
+    private async void JdAnalyze_Click(object sender, RoutedEventArgs e)
+    {
+        var document = JdText.Text?.Trim() ?? "";
+        if (document.Length == 0)
+        {
+            MessageBox.Show("Paste a job description first.", "Nothing to analyse",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (_catalog is null || _catalog.Roles.Count == 0)
+        {
+            MessageBox.Show("Sync the catalog first — there is no permission vocabulary to "
+                + "choose from, so every duty would come back unanswered.",
+                "No catalog", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var key = SecretStore.Load(_config.Ai.ApiKeyName);
+        if (string.IsNullOrEmpty(key))
+        {
+            MessageBox.Show("No AI key is stored under '" + _config.Ai.ApiKeyName +
+                "'. Store one on the Settings tab.", "No key",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        JdPlanPanel.Children.Clear();
+        JdDutyPanel.Children.Clear();
+        JdAnalyzeButton.IsEnabled = false;
+        JdCopyButton.IsEnabled = false;
+        _jdPortfolio = null;
+
+        try
+        {
+            // ONE PROVIDER FOR THE WHOLE DOCUMENT. Decomposition and every per-duty analysis
+            // share it, so a twenty-duty description opens one connection rather than
+            // twenty-one.
+            using var provider = AiProviderFactory.Create(BuildAiConfig(), key);
+            provider.PromptLogger = (stage, prompt) =>
+                File.AppendAllText(PromptLogPath,
+                    "==== " + DateTimeOffset.UtcNow.ToString("o") + " [" + stage + "] ====" +
+                    Environment.NewLine + prompt + Environment.NewLine);
+
+            JdStatus.Text = "Splitting into duties...";
+            Status("Splitting the job description into discrete duties...");
+            var functions = await provider.DecomposeAsync(document);
+
+            var validator = new RecommendationValidator
+            {
+                MaxAcceptableExcessActions = _config.MaxAcceptableExcessActions,
+                ReferenceActions = _referenceStore.ActionNames(),
+                Ineligibility = _ineligibility,
+                ReferenceDescriptions = _referenceStore.Descriptions()
+            };
+
+            var store = new RequestHistoryStore(HistoryPath);
+            var analyses = new List<DutyAnalysis>();
+            var skipped = 0;
+            var analysed = 0;
+
+            foreach (var fn in functions)
+            {
+                // NOT EVERY DUTY IS AN ACCESS REQUEST. "Mentors junior staff" has no permission,
+                // and forcing one is how unrelated access gets granted. Shown and skipped.
+                if (fn.NotAccessRelated)
+                {
+                    skipped++;
+                    JdDutyPanel.Children.Add(JdCard(
+                        "SKIPPED — not an access question", fn.Text,
+                        fn.Note.Length > 0 ? fn.Note : "No permission grants this.",
+                        "#6B7A8F"));
+                    continue;
+                }
+
+                analysed++;
+                JdStatus.Text = "Analysing duty " + analysed + "...";
+                Status("Analysing: " + fn.Text);
+                // Let the UI paint between duties — each one is several endpoint round trips.
+                await Task.Yield();
+
+                try
+                {
+                    var suggestion = await provider.SuggestAsync(
+                        fn.Text, _catalog, null, default, _referenceStore);
+                    var outcomes = validator.ValidateMulti(_catalog, suggestion, fn.Text);
+
+                    if (outcomes.Count == 0)
+                    {
+                        // A DUTY THAT PRODUCED NOTHING STILL HAPPENED. Dropping it here would
+                        // leave the plan quietly counting fewer duties than the document holds.
+                        analyses.Add(new DutyAnalysis
+                        {
+                            Duty = fn.Text,
+                            Provider = RbacProviders.Directory,
+                            Actions = Array.Empty<string>(),
+                            DeclaredReadOnly = fn.ReadOnly
+                        });
+                        JdDutyPanel.Children.Add(JdCard("NO VERDICT", fn.Text,
+                            "Nothing validated for this duty.", "#B45309"));
+                        continue;
+                    }
+
+                    foreach (var po in outcomes)
+                    {
+                        var label = po.Outcome.CustomRoleRecommended
+                            ? po.Outcome.CustomRole?.DisplayName
+                            : po.Outcome.BestFit?.DisplayName;
+
+                        analyses.Add(new DutyAnalysis
+                        {
+                            Duty = fn.Text,
+                            Provider = po.Provider,
+                            Actions = po.Outcome.ValidActions,
+                            RoleLabel = label,
+                            CustomRole = po.Outcome.CustomRoleRecommended,
+                            DeclaredReadOnly = fn.ReadOnly
+                        });
+
+                        store.Append(RequestRecordBuilder.FromOutcome(
+                            fn.Text, suggestion, po.Outcome, provider.LastPromptSha256)
+                            with { Provider = po.Provider });
+
+                        JdDutyPanel.Children.Add(JdCard(
+                            RbacProviders.DisplayName(po.Provider) + " — " +
+                                (label ?? "no covering role"),
+                            fn.Text,
+                            po.Outcome.ValidActions.Count + " permission(s): " +
+                                string.Join(", ", po.Outcome.ValidActions.Take(6)) +
+                                (po.Outcome.ValidActions.Count > 6 ? ", ..." : ""),
+                            "#1F4E79"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // ONE DUTY FAILING MUST NOT LOSE THE REST OF THE DOCUMENT — NOR ITSELF.
+                    analyses.Add(new DutyAnalysis
+                    {
+                        Duty = fn.Text,
+                        Provider = RbacProviders.Directory,
+                        Actions = Array.Empty<string>(),
+                        DeclaredReadOnly = fn.ReadOnly
+                    });
+                    JdDutyPanel.Children.Add(JdCard("ANALYSIS FAILED", fn.Text, ex.Message, "#B91C1C"));
+                }
+            }
+
+            _jdPortfolio = PortfolioComposer.Compose(analyses);
+            RenderJdPlan(_jdPortfolio, skipped);
+
+            JdCopyButton.IsEnabled = true;
+            JdStatus.Text = analysed + " duty(ies) analysed, " + skipped + " skipped.";
+            Status("Job description analysis complete — review the plan above.");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Analysis failed",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+            Status("Job description analysis failed.");
+        }
+        finally
+        {
+            JdAnalyzeButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// The PLAN goes above the per-duty transcript. The transcript is working; the plan is
+    /// what someone approves, and burying it under twenty cards means it is not read.
+    /// </summary>
+    private void RenderJdPlan(PortfolioComposer.Portfolio portfolio, int skipped)
+    {
+        JdPlanPanel.Children.Clear();
+
+        var header = new StackPanel();
+        header.Children.Add(new TextBlock
+        {
+            Style = (Style)FindResource("H1"),
+            Text = "The plan"
+        });
+        header.Children.Add(new TextBlock
+        {
+            Style = (Style)FindResource("Hint"),
+            TextWrapping = TextWrapping.Wrap,
+            Text = portfolio.Summary +
+                   (skipped > 0 ? "  " + skipped + " duty(ies) skipped as not access-related." : "")
+        });
+        JdPlanPanel.Children.Add(new Border
+        {
+            Style = (Style)FindResource("Card"),
+            Child = header
+        });
+
+        foreach (var grant in portfolio.Grants)
+        {
+            var body = new StackPanel();
+            body.Children.Add(new TextBlock
+            {
+                Text = grant.Headline,
+                FontWeight = FontWeights.Bold,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = (Brush)FindResource("Steel")
+            });
+
+            foreach (var duty in grant.Duties)
+                body.Children.Add(new TextBlock
+                {
+                    Style = (Style)FindResource("Hint"),
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(12, 4, 0, 0),
+                    Text = "• " + duty
+                });
+
+            body.Children.Add(new TextBlock
+            {
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 0),
+                Text = grant.Actions.Count + " permission(s), risk score " + grant.RiskScore
+                     + "  —  " + grant.Rationale
+            });
+
+            JdPlanPanel.Children.Add(new Border
+            {
+                Style = (Style)FindResource("Card"),
+                Child = body
+            });
+        }
+
+        if (portfolio.Unresolved.Count > 0)
+        {
+            var body = new StackPanel();
+            body.Children.Add(new TextBlock
+            {
+                Text = "No permission found",
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0xB4, 0x53, 0x09))
+            });
+            foreach (var duty in portfolio.Unresolved)
+                body.Children.Add(new TextBlock
+                {
+                    Style = (Style)FindResource("Hint"),
+                    TextWrapping = TextWrapping.Wrap,
+                    Text = "• " + duty
+                });
+            JdPlanPanel.Children.Add(new Border
+            {
+                Style = (Style)FindResource("Card"),
+                Child = body
+            });
+        }
+
+        // THE CONCERNS ARE THE POINT OF COMPOSING AT ALL. Each grant above can be individually
+        // defensible while the union is an escalation path, and no per-duty verdict can see it.
+        foreach (var concern in portfolio.Concerns)
+        {
+            var body = new StackPanel();
+            body.Children.Add(new TextBlock
+            {
+                Text = (concern.Blocking ? "[BLOCKING]  " : "") + concern.Title,
+                FontWeight = FontWeights.Bold,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = new SolidColorBrush(concern.Blocking
+                    ? Color.FromRgb(0xB9, 0x1C, 0x1C)
+                    : Color.FromRgb(0xB4, 0x53, 0x09))
+            });
+            body.Children.Add(new TextBlock
+            {
+                Style = (Style)FindResource("Hint"),
+                TextWrapping = TextWrapping.Wrap,
+                Text = concern.Detail
+            });
+            JdPlanPanel.Children.Add(new Border
+            {
+                Style = (Style)FindResource("Card"),
+                Child = body
+            });
+        }
+
+        JdPlanPanel.Children.Add(new TextBlock
+        {
+            Style = (Style)FindResource("Hint"),
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 6, 0, 14),
+            Text = "This is a portfolio, not a role. Grant the parts you accept one at a time "
+                 + "on the New Request tab — paste the duty text there and approve it as usual."
+        });
+    }
+
+    /// <summary>One duty's outcome, in the same card idiom as the rest of the app.</summary>
+    private Border JdCard(string title, string duty, string detail, string hex)
+    {
+        var body = new StackPanel();
+        body.Children.Add(new TextBlock
+        {
+            Text = title,
+            FontWeight = FontWeights.Bold,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = new SolidColorBrush(
+                (Color)ColorConverter.ConvertFromString(hex))
+        });
+        body.Children.Add(new TextBlock
+        {
+            Style = (Style)FindResource("Hint"),
+            TextWrapping = TextWrapping.Wrap,
+            Text = duty
+        });
+        body.Children.Add(new TextBlock
+        {
+            Style = (Style)FindResource("Hint"),
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 4, 0, 0),
+            Text = detail
+        });
+
+        return new Border { Style = (Style)FindResource("Card"), Child = body };
+    }
 }
 
-/// <summary>Offline keyword suggester so the GUI works with no GenAI endpoint configured.</summary>
+/// <summary>Offline keyword suggester so the GUI works with no AI endpoint configured.</summary>
 internal sealed class DemoSuggester : IRecommendationProvider
 {
     public Task<AiSuggestion> SuggestAsync(
@@ -6324,7 +6733,7 @@ internal sealed class DemoSuggester : IRecommendationProvider
         return Task.FromResult(new AiSuggestion
         {
             RequiredActions = matched,
-            Reasoning = "OFFLINE DEMO: naive keyword match — configure the GenAI endpoint for real analysis."
+            Reasoning = "OFFLINE DEMO: naive keyword match — configure the AI endpoint for real analysis."
         });
     }
 }

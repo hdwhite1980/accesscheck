@@ -1,0 +1,50 @@
+name: build
+
+# Runs on GitHub's machines when code is pushed. Nothing here ships to users and
+# nothing here touches a tenant — it builds from a clean checkout and runs the
+# deterministic test suite, which is the part that can be verified without one.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    # WINDOWS IS REQUIRED, not a preference. AccessCheck.App targets net8.0-windows
+    # with WPF, so the solution does not build on a Linux runner.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore AccessCheck.sln
+
+      # Build the WHOLE solution, not just the projects the tests reference. A test
+      # project that stops compiling is invisible to `dotnet test` alone — it simply
+      # runs whatever still builds and reports success.
+      - name: Build
+        run: dotnet build AccessCheck.sln --configuration Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test tests/AccessCheck.Core.Tests
+          --configuration Release
+          --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory ${{ github.workspace }}/TestResults
+
+      - name: Upload test results
+        if: always()   # results are most useful exactly when the step above failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ github.workspace }}/TestResults
+          retention-days: 30

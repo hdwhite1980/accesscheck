@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using AccessCheck.Core.Catalog;
 using AccessCheck.Core.Recommendation;
@@ -276,17 +276,10 @@ public sealed class ExoPurviewExecutor
         }
 
         sb.AppendLine("  # Role group carrying the grant");
-        sb.AppendLine("  if (-not (Get-RoleGroup -Identity '" + PsEnvironment.PsQ(groupName) +
-                      "' -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("    New-RoleGroup -Name '" + PsEnvironment.PsQ(groupName) +
-                      "' -Roles '" + PsEnvironment.PsQ(roleToGrant) +
-                      "' -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) + "' | Out-Null");
-        sb.AppendLine("  }");
-        sb.AppendLine("  Add-RoleGroupMember -Identity '" + PsEnvironment.PsQ(groupName) +
-                      "' -Member '" + PsEnvironment.PsQ(memberIdentity) +
-                      "'" + BypassSwitch(scope) + " -ErrorAction Stop");
-        sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = '" +
-                      PsEnvironment.PsQ(groupName) + "'; role = '" + PsEnvironment.PsQ(roleToGrant) + "' }");
+        EmitRoleGroupEnsure(sb, scope, groupName,
+            "'" + PsEnvironment.PsQ(roleToGrant) + "'", justification, memberIdentity);
+        sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = $groupName; " +
+                      "roles = $finalRoles }");
         Epilogue(sb);
         return Guarded(sb);
     }
@@ -377,70 +370,162 @@ public sealed class ExoPurviewExecutor
         var roleList = string.Join(",", rolesForGroup.Select(r => "'" + PsEnvironment.PsQ(r) + "'"));
 
         sb.AppendLine("  # ONE role group carrying every role the plan needs");
-        sb.AppendLine("  if (-not (Get-RoleGroup -Identity $groupName -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("    New-RoleGroup -Name $groupName" +
-                      " -Roles " + roleList +
-                      " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
-                      "' | Out-Null");
+        EmitRoleGroupEnsure(sb, scope, groupName, roleList, justification, memberIdentity);
+        sb.AppendLine("  $members = @((Get-RoleGroupMember -Identity $groupName" +
+                      " -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name })");
+        sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = $groupName; " +
+                      "roles = $finalRoles; created = $created; reused = $reused; members = $members }");
+        Epilogue(sb);
+        return Guarded(sb);
+    }
+
+    /// <summary>
+    /// Ensures a role group exists carrying EXACTLY the wanted roles, adds the member, and
+    /// then READS THE RESULT BACK and fails if it does not match.
+    ///
+    /// This is shared because the two grant paths had drifted apart, and the gap granted
+    /// real access. The single-role path checked only whether a group of that NAME existed
+    /// and reused it unconditionally — so an operator-named group that already carried 64
+    /// management roles (Mailbox Import Export, Mailbox Search, Legal Hold, Move Mailboxes)
+    /// was silently adopted for a request needing one cmdlet. Worse, its payload reported
+    /// the INTENDED role from C# rather than the group's actual contents, so the audit
+    /// record showed the narrow grant that was meant while the tenant held the wide one
+    /// that happened.
+    ///
+    /// The multi-role path checked contents but asked only whether anything was MISSING.
+    /// A group carrying the wanted role plus sixty others has nothing missing, so it too
+    /// would have been reused.
+    ///
+    /// So the test is set EQUALITY, in both directions:
+    ///   missing -> the group cannot do the job
+    ///   extra   -> the group grants more than was approved, which is the whole failure
+    ///              this application exists to prevent
+    /// Either way the group is unusable and a fresh suffixed one is created instead. Role
+    /// group membership is fixed at creation — there is no Set-RoleGroup -Roles — so
+    /// correcting one in place is not an option.
+    ///
+    /// Leaves $groupName and $finalRoles set for the caller's payload.
+    /// </summary>
+    private void EmitRoleGroupEnsure(
+        StringBuilder sb, RbacScope scope, string groupName, string roleListPs,
+        string justification, string memberIdentity)
+    {
+        sb.AppendLine("  $groupName = '" + PsEnvironment.PsQ(groupName) + "'");
+        sb.AppendLine("  $wanted = @(" + roleListPs + ")");
+        sb.AppendLine("  $desc = '" + PsEnvironment.PsQ(Marker + ". " + justification) + "'");
+        sb.AppendLine("  function Get-AcRoleNames($g) {");
+        sb.AppendLine("    return @($g.Roles | ForEach-Object { $_.ToString().Split('\\')[-1] })");
+        sb.AppendLine("  }");
+
+        sb.AppendLine("  $group = Get-RoleGroup -Identity $groupName -ErrorAction SilentlyContinue");
+        sb.AppendLine("  if (-not $group) {");
+        sb.AppendLine("    New-RoleGroup -Name $groupName -Roles $wanted -Description $desc | Out-Null");
         sb.AppendLine("  } else {");
-        // A role group's ROLES are fixed at creation — Set-RoleGroup has no -Roles parameter
-        // anywhere, and New-ManagementRoleAssignment is not applicable to Security &
-        // Compliance. So an existing group carrying the WRONG roles cannot be corrected.
-        //
-        // But that is not a reason to stop. If it already carries what we need, just add the
-        // member. If it does not, create a fresh suffixed group and use that — telling the
-        // operator to go and delete something by hand is work the app can do itself.
-        sb.AppendLine("    $existing = @((Get-RoleGroup -Identity $groupName).Roles | " +
-                      "ForEach-Object { $_.ToString().Split('\\')[-1] })");
-        sb.AppendLine("    $wanted = @(" + roleList + ")");
-        sb.AppendLine("    $missing = @($wanted | Where-Object { $existing -notcontains $_ })");
-        sb.AppendLine("    if ($missing.Count -eq 0) {");
-        sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###role group already carries the needed roles; adding the member')");
+        sb.AppendLine("    $have = Get-AcRoleNames $group");
+        sb.AppendLine("    $missing = @($wanted | Where-Object { $have -notcontains $_ })");
+        sb.AppendLine("    $extra   = @($have | Where-Object { $wanted -notcontains $_ })");
+        sb.AppendLine("    if ($missing.Count -eq 0 -and $extra.Count -eq 0) {");
+        sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###role group already carries exactly the needed role(s); adding the member')");
         sb.AppendLine("    } else {");
-        sb.AppendLine("      $base = '" + PsEnvironment.PsQ(groupName) + "'");
+        sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###existing group ' + $groupName + ' carries ' + $have.Count + ' role(s), ' + $extra.Count + ' more than approved - it will NOT be reused')");
+        sb.AppendLine("      $base = $groupName");
         sb.AppendLine("      $picked = $null");
-        sb.AppendLine("      foreach ($n in 2..20) {");
+        sb.AppendLine("      foreach ($i in 2..20) {");
+        sb.AppendLine("        $tag = ' (' + $i + ')'");
         sb.AppendLine("        $candidate = $base");
-        // Keep the suffix inside the 64-character limit rather than overflowing it.
-        sb.AppendLine("        $tag = ' (' + $n + ')'");
         sb.AppendLine("        if (($candidate.Length + $tag.Length) -gt 64) {");
         sb.AppendLine("          $candidate = $candidate.Substring(0, 64 - $tag.Length)");
         sb.AppendLine("        }");
         sb.AppendLine("        $candidate = $candidate + $tag");
         sb.AppendLine("        $found = Get-RoleGroup -Identity $candidate -ErrorAction SilentlyContinue");
-        sb.AppendLine("        if (-not $found) { $picked = $candidate; break }");
-        sb.AppendLine("        $have = @($found.Roles | ForEach-Object { $_.ToString().Split('\\')[-1] })");
-        sb.AppendLine("        $short = @($wanted | Where-Object { $have -notcontains $_ })");
-        sb.AppendLine("        if ($short.Count -eq 0) { $picked = $candidate; $groupExisted = $true; break }");
+        sb.AppendLine("        if (-not $found) {");
+        sb.AppendLine("          New-RoleGroup -Name $candidate -Roles $wanted -Description $desc | Out-Null");
+        sb.AppendLine("          $picked = $candidate; break");
+        sb.AppendLine("        }");
+        sb.AppendLine("        $fHave = Get-AcRoleNames $found");
+        sb.AppendLine("        $fMissing = @($wanted | Where-Object { $fHave -notcontains $_ })");
+        sb.AppendLine("        $fExtra   = @($fHave | Where-Object { $wanted -notcontains $_ })");
+        sb.AppendLine("        if ($fMissing.Count -eq 0 -and $fExtra.Count -eq 0) { $picked = $candidate; break }");
         sb.AppendLine("      }");
         sb.AppendLine("      if (-not $picked) {");
-        sb.AppendLine("        throw \"Could not find a usable role group name after 20 attempts. \" + " +
-                      "\"Remove the unused ACG- groups for this grant and re-run.\"");
-        sb.AppendLine("      }");
-        sb.AppendLine("      [Console]::Out.WriteLine('###PROGRESS###existing group carries the wrong roles; using ' + $picked)");
-        sb.AppendLine("      if (-not (Get-RoleGroup -Identity $picked -ErrorAction SilentlyContinue)) {");
-        sb.AppendLine("        New-RoleGroup -Name $picked -Roles " + roleList +
-                      " -Description '" + PsEnvironment.PsQ(Marker + ". " + justification) +
-                      "' | Out-Null");
+        sb.AppendLine("        throw 'Could not find or create a role group carrying exactly the approved role(s) after 20 attempts. Remove the unused ACG- groups for this grant and re-run. Nothing was granted.'");
         sb.AppendLine("      }");
         sb.AppendLine("      $groupName = $picked");
         sb.AppendLine("    }");
         sb.AppendLine("  }");
 
-        // From here on use the VARIABLE, not the literal — the group may have been
-        // renamed above, and reading back the wrong name would report success against a
-        // group the member was never added to.
         sb.AppendLine("  Add-RoleGroupMember -Identity $groupName" +
                       " -Member '" + PsEnvironment.PsQ(memberIdentity) +
                       "'" + BypassSwitch(scope) + " -ErrorAction Stop");
 
-        // Read the group back: creation succeeding is an attempt, this is the result.
+        // CREATION SUCCEEDING IS AN ATTEMPT; THIS IS THE RESULT. Everything above reasons
+        // about what SHOULD be there. Only this reads what IS, and it is the last point at
+        // which an over-grant can still be caught by the app rather than by an auditor.
         sb.AppendLine("  $final = Get-RoleGroup -Identity $groupName");
-        sb.AppendLine("  $finalRoles = @($final.Roles | ForEach-Object { $_.ToString().Split('\\')[-1] })");
-        sb.AppendLine("  $members = @((Get-RoleGroupMember -Identity $groupName" +
-                      " -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name })");
-        sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; roleGroup = $groupName; " +
-                      "roles = $finalRoles; created = $created; reused = $reused; members = $members }");
+        sb.AppendLine("  $finalRoles = Get-AcRoleNames $final");
+        sb.AppendLine("  $verifyExtra = @($finalRoles | Where-Object { $wanted -notcontains $_ })");
+        sb.AppendLine("  if ($verifyExtra.Count -gt 0) {");
+        sb.AppendLine("    Remove-RoleGroupMember -Identity $groupName -Member '" +
+                      PsEnvironment.PsQ(memberIdentity) + "'" + BypassSwitch(scope) +
+                      " -Confirm:$false -ErrorAction SilentlyContinue");
+        sb.AppendLine("    throw 'OVER-GRANT BLOCKED: role group ' + $groupName + ' carries ' + " +
+                      "$verifyExtra.Count + ' role(s) beyond what was approved (' + " +
+                      "($verifyExtra -join ', ') + '). The member has been removed again and " +
+                      "nothing was granted.'");
+        sb.AppendLine("  }");
+    }
+
+    /// <summary>
+    /// Removes MANY memberships in ONE session, and distinguishes "already gone" from
+    /// "failed".
+    ///
+    /// Two problems with doing them one at a time, both seen on a real run:
+    ///
+    /// COST. Every RunAsync starts a PowerShell process and reconnects to Exchange —
+    /// roughly thirty seconds. Three expired grants took a minute and a half; fifty would
+    /// take twenty-five minutes, inside a scheduled task with a one-hour ceiling.
+    ///
+    /// CLASSIFICATION. A role group deleted by hand reports "object couldn't be found",
+    /// which was counted as a failure. But the access IS revoked — that is the outcome
+    /// housekeeping wanted. Treating it as a failure meant the record was never closed,
+    /// every later run retried it, and the exit code stayed non-zero forever. A scheduled
+    /// task that always reports failure is a scheduled task nobody reads, so a genuine
+    /// failure would have been lost in the noise.
+    ///
+    /// Returns results[] with state = removed | alreadyGone | failed, per membership.
+    /// </summary>
+    public string BuildRemoveMembersScript(
+        RbacScope scope, IReadOnlyList<(string Group, string Member)> removals)
+    {
+        var sb = new StringBuilder();
+        Prologue(sb, scope);
+        sb.AppendLine("  $results = @()");
+
+        foreach (var (group, member) in removals)
+        {
+            var g = PsEnvironment.PsQ(group);
+            var m = PsEnvironment.PsQ(member);
+            sb.AppendLine("  try {");
+            sb.AppendLine("    Remove-RoleGroupMember -Identity '" + g + "' -Member '" + m +
+                          "'" + BypassSwitch(scope) + " -Confirm:$false -ErrorAction Stop");
+            sb.AppendLine("    $results += [pscustomobject]@{ group = '" + g + "'; member = '" + m +
+                          "'; state = 'removed'; error = '' }");
+            sb.AppendLine("  } catch {");
+            sb.AppendLine("    $m = $_.Exception.Message");
+            // The apostrophe in "couldn't" is not always the ASCII one, so wildcard across
+            // it rather than matching the exact phrase.
+            sb.AppendLine("    if ($m -like '*couldn*t be found*' -or $m -like '*not found*' " +
+                          "-or $m -like '*ManagementObjectNotFound*' -or $m -like '*isn*t a member*') {");
+            sb.AppendLine("      $results += [pscustomobject]@{ group = '" + g + "'; member = '" + m +
+                          "'; state = 'alreadyGone'; error = $m }");
+            sb.AppendLine("    } else {");
+            sb.AppendLine("      $results += [pscustomobject]@{ group = '" + g + "'; member = '" + m +
+                          "'; state = 'failed'; error = $m }");
+            sb.AppendLine("    }");
+            sb.AppendLine("  }");
+        }
+
+        sb.AppendLine("  $payload = [pscustomobject]@{ ok = $true; results = $results }");
         Epilogue(sb);
         return Guarded(sb);
     }

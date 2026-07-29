@@ -2,7 +2,7 @@ namespace AccessCheck.Ai;
 
 /// <summary>
 /// Same provider shape as MacLens: an OpenAI-compatible chat-completions endpoint
-/// with a configurable base URL, so the app points at the org GenAI gateway
+/// with a configurable base URL, so the app points at the org AI gateway
 /// (VPN-side) today and can swap endpoints later without code changes.
 /// The API key is NEVER stored here — it lives in SecretStore (DPAPI).
 /// </summary>
@@ -20,7 +20,7 @@ public sealed record AiProviderConfig
     /// <summary>Prefix before the key in the auth header. Empty string for gateways using a bare api-key header.</summary>
     public string AuthValuePrefix { get; init; } = "Bearer ";
     /// <summary>Name under which the key is stored in SecretStore.</summary>
-    public string ApiKeyName { get; init; } = "accesscheck-genai";
+    public string ApiKeyName { get; init; } = "accesscheck-ai";
     public int TimeoutSeconds { get; init; } = 120;
     /// <summary>Max roles sent with full action lists in stage 2.</summary>
     public int ShortlistSize { get; init; } = 8;

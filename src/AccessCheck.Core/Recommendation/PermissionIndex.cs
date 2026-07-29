@@ -1,4 +1,4 @@
-using AccessCheck.Core.Catalog;
+﻿using AccessCheck.Core.Catalog;
 
 namespace AccessCheck.Core.Recommendation;
 
@@ -256,6 +256,96 @@ public sealed class PermissionIndex
         return readMarkers.Any(m => a.Contains(m, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Whether a request word appears in an action name or its prose.
+    ///
+    /// A plain Contains is DIRECTIONAL, and the direction is wrong for English. A request
+    /// says "mailboxes", "messages", "policies"; Microsoft names resources in the
+    /// singular — Remove-Mailbox, conditionalAccessPolicies. "remove-mailbox" does not
+    /// contain "mailboxes", so the single most relevant word in a mailbox request scored
+    /// nothing at all against the mailbox permissions.
+    ///
+    /// Only regular plural endings are stripped, and only down to three characters, so
+    /// this cannot turn a short word into a prefix that matches everything.
+    /// </summary>
+    /// <summary>
+    /// True when the word IS one of the action's path segments, rather than merely
+    /// appearing inside one.
+    ///
+    /// Resource names are segments — microsoft.directory/USERS/password/update,
+    /// Microsoft.Intune_DEVICECOMPLIANCEPOLICES_Read — and a request naming a resource
+    /// means that resource, not every longer name containing it. Without this, "users"
+    /// matched agentUsers and guestUsers as strongly as users, and "groups" matched
+    /// groups.security, groups.unified and accessReviews/definitions.groups alike.
+    /// </summary>
+    internal static bool SegmentMatches(string action, string word)
+    {
+        var segments = action.Split(new[] { '/', '_', '.', '-', ' ' },
+            StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var segment in segments)
+        {
+            if (segment.Equals(word, StringComparison.OrdinalIgnoreCase)) return true;
+
+            // NUMBER HAS TO MATCH IN BOTH DIRECTIONS.
+            //
+            // Request plural against a singular segment — "mailboxes" reaching "mailbox" —
+            // is the case I wrote first. The commoner one is the reverse: Microsoft names
+            // resources in the PLURAL, and requests describe them in the singular. "create
+            // user accounts" carries the word "user"; the segment is "users". Handling only
+            // one direction left the most natural phrasing scoring nothing at all against
+            // the resource it named.
+            if (word.EndsWith("ies", StringComparison.Ordinal) && word.Length > 4
+                && segment.Equals(word[..^3] + "y", StringComparison.OrdinalIgnoreCase)) return true;
+            if (word.EndsWith("es", StringComparison.Ordinal) && word.Length > 4
+                && segment.Equals(word[..^2], StringComparison.OrdinalIgnoreCase)) return true;
+            if (word.EndsWith('s') && word.Length > 3
+                && segment.Equals(word[..^1], StringComparison.OrdinalIgnoreCase)) return true;
+
+            // Singular request word, plural segment.
+            if (word.Length > 2)
+            {
+                if (segment.Equals(word + "s", StringComparison.OrdinalIgnoreCase)) return true;
+                if (segment.Equals(word + "es", StringComparison.OrdinalIgnoreCase)) return true;
+                if (word.EndsWith('y')
+                    && segment.Equals(word[..^1] + "ies", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    internal static bool NameMatches(string haystack, string word)
+    {
+        if (haystack.Contains(word, StringComparison.Ordinal)) return true;
+
+        // policies -> policy, and the -ies form is why this is not just trimming an s.
+        if (word.EndsWith("ies", StringComparison.Ordinal) && word.Length > 4
+            && haystack.Contains(word[..^3] + "y", StringComparison.Ordinal)) return true;
+
+        if (word.EndsWith("es", StringComparison.Ordinal) && word.Length > 4
+            && haystack.Contains(word[..^2], StringComparison.Ordinal)) return true;
+
+        if (word.EndsWith('s') && word.Length > 3
+            && haystack.Contains(word[..^1], StringComparison.Ordinal)) return true;
+
+        // AND THE OTHER DIRECTION. The same asymmetry as SegmentMatches, and it bites
+        // harder here because this is the fallback: a singular request word scored NOTHING
+        // against a plural resource name. "review every Conditional Access policy" carries
+        // "policy"; the action is conditionalAccessPolicies, a compound segment where the
+        // segment rule correctly does not apply — so this substring path was the only one
+        // left, and it was failing too.
+        if (word.Length > 2)
+        {
+            if (haystack.Contains(word + "s", StringComparison.Ordinal)) return true;
+            if (haystack.Contains(word + "es", StringComparison.Ordinal)) return true;
+            if (word.EndsWith('y')
+                && haystack.Contains(word[..^1] + "ies", StringComparison.Ordinal)) return true;
+        }
+
+        return false;
+    }
+
     public static IReadOnlyList<PermissionEntry> CandidateActions(
         string functionDescription, RoleCatalog catalog, int perProviderLimit = 60,
         ReferenceStore? reference = null)
@@ -298,9 +388,17 @@ public sealed class PermissionIndex
             var score = 0;
             foreach (var word in words)
             {
-                // A hit in the ACTION NAME is stronger evidence than one in prose.
-                if (name.Contains(word, StringComparison.Ordinal)) score += 3;
-                else if (haystack.Contains(word, StringComparison.Ordinal)) score += 2;
+                // A WHOLE SEGMENT BEATS A SUBSTRING INSIDE ONE.
+                //
+                // "microsoft.directory/agentUsers/disable" contains "users", so a request
+                // about user accounts scored agent-user permissions exactly as highly as
+                // real ones — and agentUsers has more actions, so it crowded the candidate
+                // list. Three duties in one run came back proposing agentUsers, and only
+                // the verifier stopped them; two then had nothing left and produced no
+                // answer at all. Agent users are a different object type entirely.
+                if (SegmentMatches(name, word)) score += 5;
+                else if (NameMatches(name, word)) score += 3;
+                else if (NameMatches(haystack, word)) score += 2;
                 else continue;
 
                 // A read permission answering a read-shaped request is the better fit.
@@ -309,8 +407,25 @@ public sealed class PermissionIndex
             if (score > 0) scored.Add((entry, score));
         }
 
+        // TIES DECIDED BY NARROWNESS, NOT BY CATALOG ORDER.
+        //
+        // Sorting on score alone leaves ties in whatever order Build happened to produce,
+        // and ties are the common case: one shared word scores 3, so dozens of Purview
+        // cmdlets containing "compliance" score identically. Which of them survived the
+        // per-provider cap was therefore decided by catalog order — the same request
+        // returned different permissions on different runs, and New-ComplianceSearch lost
+        // its place to cmdlets that merely shared a word.
+        //
+        // Breaking ties by breadth then by name length puts the specific permission ahead
+        // of the sweeping one, and makes the same request produce the same candidates
+        // every time. A recommendation that changes between identical runs cannot be
+        // reviewed, and cannot be defended afterwards.
         var byProvider = new Dictionary<string, List<PermissionEntry>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in scored.OrderByDescending(s => s.Score))
+        foreach (var item in scored
+            .OrderByDescending(s => s.Score)
+            .ThenBy(s => (int)PermissionBreadth.Classify(s.Entry.Action))
+            .ThenBy(s => s.Entry.Action.Length)
+            .ThenBy(s => s.Entry.Action, StringComparer.OrdinalIgnoreCase))
         {
             if (!byProvider.TryGetValue(item.Entry.Provider, out var list))
                 byProvider[item.Entry.Provider] = list = new List<PermissionEntry>();

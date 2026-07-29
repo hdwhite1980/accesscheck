@@ -10,6 +10,7 @@
     <ProjectReference Include="..\AccessCheck.Core\AccessCheck.Core.csproj" />
     <ProjectReference Include="..\AccessCheck.Ai\AccessCheck.Ai.csproj" />
     <ProjectReference Include="..\AccessCheck.Graph\AccessCheck.Graph.csproj" />
+    <ProjectReference Include="..\AccessCheck.PowerShell\AccessCheck.PowerShell.csproj" />
   </ItemGroup>
   <ItemGroup>
     <None Include="appsettings.sample.json" CopyToOutputDirectory="PreserveNewest" />

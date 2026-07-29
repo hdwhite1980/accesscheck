@@ -1,0 +1,45 @@
+Copyright (c) Accelerated Hues Technology Services LLC. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL
+
+This software and its source code are the confidential and proprietary property of
+Accelerated Hues Technology Services LLC ("the Company").
+
+No licence, express or implied, is granted by the mere availability of this repository
+or its contents. Use of this software requires a separate written agreement with the
+Company.
+
+Without a written agreement, you may NOT:
+
+  - use, execute, or run this software for any purpose;
+  - copy, reproduce, or distribute this software or any portion of it;
+  - modify, adapt, translate, or create derivative works from it;
+  - reverse engineer, decompile, or disassemble any compiled form of it;
+  - sublicense, rent, lease, lend, sell, or otherwise transfer it;
+  - remove or obscure this notice or any proprietary marking.
+
+NO WARRANTY
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NONINFRINGEMENT.
+
+LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE COMPANY BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THIS SOFTWARE OR ITS USE.
+
+This software modifies role-based access control configuration in the operating
+environments in which it is used. The user is solely responsible for reviewing and
+approving every change before it is applied, and for the consequences of any change
+applied. The software presents each proposed change for explicit human approval and
+performs no modification without it.
+
+THIRD-PARTY COMPONENTS
+
+This software incorporates third-party components distributed under their own licence
+terms, including Microsoft.Identity.Client (MSAL.NET) and xunit. Those terms govern
+those components.
+
+Contact: Accelerated Hues Technology Services LLC

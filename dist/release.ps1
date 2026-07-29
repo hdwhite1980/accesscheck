@@ -34,6 +34,28 @@ if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
 $distDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $distDir
 
+# --- verify BEFORE anything is versioned, built or signed ---
+#
+# This is the only chokepoint every release passes through, so it is the right place to
+# make a broken build unshippable. It matters more here than in most projects: when the
+# risk-weighting or task-coverage rules break, nothing crashes - the app renders a
+# confident verdict that happens to be wrong, and an operator approves it. The tests are
+# what notice. Running them after signing would be theatre.
+Write-Host "Building and testing before release..." -ForegroundColor Cyan
+
+dotnet build (Join-Path $repoRoot "AccessCheck.sln") -c Release
+if ($LASTEXITCODE -ne 0) {
+    throw "Build failed - nothing was versioned, signed or installed."
+}
+
+dotnet test (Join-Path $repoRoot "tests\AccessCheck.Core.Tests") -c Release --no-build
+if ($LASTEXITCODE -ne 0) {
+    throw "Tests FAILED - refusing to cut a release. Run dotnet test to see which."
+}
+
+Write-Host "Verified.`n" -ForegroundColor Green
+
+
 # --- what is already installed? MSIX will silently keep the old binary otherwise ---
 $installed = Get-AppxPackage -Name "AHTS.AccessCheck" -ErrorAction SilentlyContinue
 if ($installed) {

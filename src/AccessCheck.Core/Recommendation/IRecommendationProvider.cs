@@ -3,7 +3,7 @@ using AccessCheck.Core.Catalog;
 namespace AccessCheck.Core.Recommendation;
 
 /// <summary>
-/// Inference abstraction. Implementations may call a remote GenAI endpoint.
+/// Inference abstraction. Implementations may call a remote AI endpoint.
 /// DELIBERATE CONSTRAINT: the signature accepts ONLY the function description and
 /// role catalog data — no principal, UPN, tenant ID, or assignment history can be
 /// passed, so identity data provably never reaches the model.

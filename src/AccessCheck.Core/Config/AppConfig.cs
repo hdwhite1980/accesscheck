@@ -89,7 +89,7 @@ public sealed record AppConfig
         public string Model { get; init; } = "";
         public string AuthHeaderName { get; init; } = "Authorization";
         public string AuthValuePrefix { get; init; } = "Bearer ";
-        public string ApiKeyName { get; init; } = "accesscheck-genai";
+        public string ApiKeyName { get; init; } = "accesscheck-ai";
         public int ShortlistSize { get; init; } = 8;
     }
 
