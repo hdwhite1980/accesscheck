@@ -88,6 +88,20 @@ public partial class MainWindow : Window
         // THE REFERENCE MUST LOAD FIRST. PermissionIndex takes Microsoft's descriptions from
         // it, so building the index before the reference exists produced an index with no
         // real descriptions — and it stayed that way until the next rebuild.
+        // FIRST RUN ONLY, AND NEVER OVERWRITING. Two files carry knowledge no tenant can
+        // produce for itself: Microsoft exposes no Purview role contents through any API,
+        // and Exchange Online's REST proxy cmdlets carry no help text. Without them a fresh
+        // install holds vocabulary for 8 Purview roles out of 120 and reads Exchange cmdlet
+        // NAMES with nothing to check them against — which is how a request to remove
+        // messages came back with Remove-Mailbox.
+        //
+        // Seeded BEFORE the reference and catalog load below, or the first launch runs
+        // without them and the user sees the degraded behaviour once for no reason.
+        var seeded = SeedData.EnsureSeeded(_dataDir);
+        if (seeded.Count > 0)
+            _lastSyncReport.Add("First run: installed bundled reference data (" +
+                                string.Join(", ", seeded) + ").");
+
         _referenceStore = ReferenceStore.Load(ReferencePath);
         _cmdletCapabilities = CmdletCapabilityStore.Load(CmdletCapabilityPath);
         _ineligibility = CustomRoleEligibility.Load(IneligibilityPath);
@@ -115,7 +129,8 @@ public partial class MainWindow : Window
                 _catalog = RoleCatalog.Load(CatalogPath);
                 PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
                 // The built-in map covers a handful by hand; Microsoft publishes all 119.
-                PurviewRoleCatalog.Load(PurviewRolesPath).EnrichCatalog(_catalog);
+                PurviewRoleCatalog.LoadOrImport(PurviewRolesPath, PurviewRolesMarkdownPath)
+                    .EnrichCatalog(_catalog);
                 RefreshCatalogGrid();
         RebuildPermissionCatalog();
         RefreshForcedProviderList();
@@ -1565,7 +1580,8 @@ public partial class MainWindow : Window
             // mapping. Fill in the well-known ones from Microsoft's documentation so the
             // service is usable — clearly labelled, and never overwriting tenant data.
             var enrichedPurview = PurviewRoleMap.EnrichNameOnlyRoles(_catalog);
-            enrichedPurview += PurviewRoleCatalog.Load(PurviewRolesPath).EnrichCatalog(_catalog);
+            enrichedPurview += PurviewRoleCatalog.LoadOrImport(PurviewRolesPath, PurviewRolesMarkdownPath)
+                    .EnrichCatalog(_catalog);
             if (enrichedPurview > 0)
             {
                 _lastSyncReport.Add("Purview: filled in " + enrichedPurview + " role(s) from "
@@ -2294,10 +2310,16 @@ public partial class MainWindow : Window
     /// <summary>Microsoft's published Purview role list. The Security and Compliance session
     /// cannot report what a Purview role contains, so this is the only vocabulary it has.</summary>
     private string PurviewRolesPath => Path.Combine(_dataDir, "purview-roles.json");
+    /// <summary>Microsoft's published page as downloaded. Parsed into the JSON above on
+    /// first use, so the package ships what Microsoft publishes rather than a cache.</summary>
+    private string PurviewRolesMarkdownPath => Path.Combine(_dataDir, "purview-roles.md");
     /// <summary>Exchange and Purview cmdlet descriptions. No API supplies these, and without
     /// them the model reads names only — which is how a request to remove MESSAGES became
     /// Remove-Mailbox, a cmdlet that deletes the mailbox and the user account with it.</summary>
     private string CmdletDescriptionsPath => Path.Combine(_dataDir, "exchange-descriptions.json");
+    /// <summary>Endpoint responses keyed by prompt hash. The endpoint will not be
+    /// deterministic even at temperature 0, so reproducibility is taken here instead.</summary>
+    private string PromptCachePath => Path.Combine(_dataDir, "prompt-cache.json");
     private string CmdletCapabilityPath => Path.Combine(_dataDir, "cmdlet-capabilities.json");
     private string ReferencePath => Path.Combine(_dataDir, "reference.json");
 
@@ -6426,6 +6448,13 @@ public partial class MainWindow : Window
             // share it, so a twenty-duty description opens one connection rather than
             // twenty-one.
             using var provider = AiProviderFactory.Create(BuildAiConfig(), key);
+
+            // SAME DOCUMENT, SAME PLAN. The endpoint is not deterministic even at
+            // temperature 0 with a fixed seed — re-running one job description produced a
+            // different split of the duties and therefore different answers throughout.
+            var promptCache = new PromptCache(PromptCachePath);
+            provider.Cache = promptCache;
+
             provider.PromptLogger = (stage, prompt) =>
                 File.AppendAllText(PromptLogPath,
                     "==== " + DateTimeOffset.UtcNow.ToString("o") + " [" + stage + "] ====" +
@@ -6534,7 +6563,8 @@ public partial class MainWindow : Window
                 }
             }
 
-            _jdPortfolio = PortfolioComposer.Compose(analyses);
+            promptCache.Save();
+        _jdPortfolio = PortfolioComposer.Compose(analyses);
             RenderJdPlan(_jdPortfolio, skipped);
 
             JdCopyButton.IsEnabled = true;

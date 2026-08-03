@@ -11,6 +11,10 @@ using AccessCheck.PowerShell;
 var dataDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AccessCheck");
 Directory.CreateDirectory(dataDir);
+// Install the bundled Purview role list and Exchange cmdlet descriptions on first run.
+// Neither can be discovered from a tenant, and without them two whole services answer
+// with names alone.
+SeedData.EnsureSeeded(dataDir);
 var catalogPath = Path.Combine(dataDir, "catalog.json");
 var historyPath = Path.Combine(dataDir, "history.jsonl");
 var promptLogPath = Path.Combine(dataDir, "prompt-log.txt");
@@ -24,10 +28,18 @@ var referencePath = Path.Combine(dataDir, "reference.json");
 // Microsoft's published Purview role list. The Security and Compliance session cannot
 // report what a Purview role contains, so this is the only vocabulary that service has.
 var purviewRolesPath = Path.Combine(dataDir, "purview-roles.json");
+// Microsoft's published page as downloaded; parsed into the JSON above on first use.
+var purviewRolesMarkdownPath = Path.Combine(dataDir, "purview-roles.md");
+// Endpoint responses keyed by prompt hash. The endpoint will not be deterministic even
+// at temperature 0, so reproducibility is taken here instead.
+var promptCachePath = Path.Combine(dataDir, "prompt-cache.json");
 // Exchange and Purview cmdlet descriptions, imported from Microsoft's published docs.
 // These two services are the only ones whose permissions otherwise reach the model
 // with no description at all.
 var cmdletDescriptionsPath = Path.Combine(dataDir, "exchange-descriptions.json");
+// Hand-written notes distinguishing confusable permissions. Editable, and shipped with
+// a built-in set covering the confusions that have actually produced wrong answers.
+var actionNotesPath = Path.Combine(dataDir, "action-notes.json");
 var configPath = new[]
 {
     // THE GUI'S CONFIG COMES FIRST. Both tools share %APPDATA%\AccessCheck for catalog,
@@ -56,6 +68,7 @@ if (args.Length == 0)
           accesscheck recommend "<function>"            GenAI suggest -> validate -> show verdicts
           accesscheck approve <principalId> "<function>" [P14D] [--eligible]
                                                        full flow incl. Graph execution after Y/N
+          accesscheck clear-cache                       forget cached endpoint responses
           accesscheck jd <file.txt|"<text>">           split a job description into duties and
                                                        analyse each one separately
           accesscheck housekeeping                      GC roles + remove expired direct grants
@@ -276,6 +289,19 @@ switch (command)
         return 0;
     }
 
+    case "clear-cache":
+    {
+        // A CACHED ANSWER IS A STALE ANSWER once the question changes for a reason the hash
+        // cannot see — a model upgraded behind the same name, or an endpoint corrected. The
+        // key covers the model and both prompts, so ordinary changes invalidate themselves;
+        // this is for the rest.
+        var cache = new PromptCache(promptCachePath);
+        var had = cache.Count;
+        cache.Clear();
+        Console.WriteLine("Cleared " + had + " cached response(s).");
+        return 0;
+    }
+
     case "jd":
     {
         if (args.Length < 2)
@@ -310,8 +336,29 @@ switch (command)
                             + "only read their names — run dist\\import-exchange-descriptions.ps1.)");
         }
 
+        // DISAMBIGUATION NOTES, APPENDED TO MICROSOFT'S OWN WORDS.
+        //
+        // Where two actions are routinely confused, an accurate description is not always a
+        // useful one: "Disable users" beside "Update basic properties on users" reads as
+        // though the second is broader and covers the first, and a duty to disable accounts
+        // was answered with the property update run after run. The note says which similar
+        // thing the permission is NOT. Microsoft still says what it is.
+        // ANNOTATE THE STORE, NOT A COPY OF IT. PermissionIndex builds the candidate list
+        // the model chooses from out of the ReferenceStore object; a dictionary derived
+        // from it reaches only the guards and the validator. Annotating the dictionary left
+        // the choosing stage reading the original text and producing the identical wrong
+        // reasoning, word for word.
+        var actionNotes = ActionNoteStore.Load(actionNotesPath);
+        ActionNoteStore.Install(actionNotes);
+        if (actionNotes.Count > 0)
+            Console.WriteLine("(" + actionNotes.Count + " permission(s) carry a disambiguation note.)");
+
+        // Microsoft's descriptions, unannotated. CitationCheck compares the model's quote
+        // against these, so a note written in here would make an honest quote look invented.
+        var describedActions = reference.Descriptions();
+
         ActionRisk.UseAuthoritative(reference.StatedPrivilege());
-        ActionRisk.UseDescriptions(reference.Descriptions());
+        ActionRisk.UseDescriptions(describedActions);
 
         string? aiKey = SecretStore.Load(cfg.Ai.ApiKeyName);
         if (string.IsNullOrEmpty(aiKey))
@@ -341,6 +388,12 @@ switch (command)
             ApiKeyName = cfg.Ai.ApiKeyName,
             ShortlistSize = cfg.Ai.ShortlistSize
         }, aiKey);
+        // SAME DOCUMENT, SAME PLAN. Without this, re-running one job description produced a
+        // different split and therefore different answers, which makes a plan impossible to
+        // review and impossible to defend afterwards.
+        var promptCache = new PromptCache(promptCachePath);
+        jdProvider.Cache = promptCache;
+
         jdProvider.PromptLogger = (stage, prompt) =>
             File.AppendAllText(promptLogPath,
                 "==== " + DateTimeOffset.UtcNow.ToString("o") + " [" + stage + "] ====\n"
@@ -370,13 +423,13 @@ switch (command)
         //   reasoning this app forbids the model.
         var ineligibility = CustomRoleEligibility.Load(
             Path.Combine(dataDir, "custom-role-ineligible.json"));
-        var refDescriptions = reference.Descriptions();
+        var refDescriptions = describedActions;
         var jdValidator = new RecommendationValidator
         {
             MaxAcceptableExcessActions = cfg.MaxAcceptableExcessActions,
             ReferenceActions = reference.ActionNames(),
             Ineligibility = ineligibility,
-            ReferenceDescriptions = reference.Descriptions()
+            ReferenceDescriptions = describedActions
         };
         var jdStore = new RequestHistoryStore(historyPath);
         var skipped = 0;
@@ -434,33 +487,20 @@ switch (command)
                 // (wrong-resource, inverse-permission, limits-RBAC-cannot-express) are
                 // still trapped in the WPF layer and remain unavailable to any other
                 // caller.
-                foreach (var po in outcomes)
+                // EVERY GUARD, NOT THE TWO THAT HAPPENED TO BE REACHABLE. Only
+                // CapabilityCoverage and PermissionBreadth were wired here; the other eight
+                // ran solely in the desktop app, so this path produced verdicts with most of
+                // the deterministic safety layer switched off. A duty answered with
+                // Remove-Mailbox — which deletes the mailbox and the user account — passed
+                // with no comment, because the guard built to catch exactly that was
+                // unreachable from here.
+                var guardFindings = GuardReport.Build(
+                    fn.Text, outcomes, catalog, refDescriptions, suggestion.Confidence);
+
+                if (guardFindings.Count > 0)
                 {
-                    var acts = po.Outcome.ValidActions;
-                    if (acts.Count == 0) continue;
-
-                    var described = acts
-                        .Select(a => (a, refDescriptions.TryGetValue(a, out var d) ? d : ""))
-                        .ToList();
-
-                    foreach (var gap in CapabilityCoverage.Gaps(fn.Text, described))
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine("  !! GAP — " + gap.Capability
-                                          + (gap.NamesOnly ? " (unconfirmed)" : ""));
-                        foreach (var line in gap.Message.Split('\n'))
-                            Console.WriteLine("     " + line.Trim());
-                    }
-
-                    foreach (var finding in PermissionBreadth.Findings(acts, catalog))
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine("  !! TOO BROAD — " + finding.Action);
-                        Console.WriteLine("     " + finding.Message);
-                        if (finding.Examples.Count > 0)
-                            Console.WriteLine("     narrower: "
-                                + string.Join(", ", finding.Examples.Take(4)));
-                    }
+                    Console.WriteLine();
+                    Console.Write(GuardReport.Describe(guardFindings));
                 }
 
                 // A DUTY THAT PRODUCED NOTHING STILL HAPPENED.
@@ -529,6 +569,11 @@ switch (command)
         Console.WriteLine("THE PLAN");
         Console.WriteLine(new string('=', 78));
         Console.WriteLine();
+
+        promptCache.Save();
+        if (promptCache.Hits > 0)
+            Console.WriteLine("(" + promptCache.Hits + " endpoint call(s) answered from cache; " +
+                              promptCache.Misses + " asked.)");
 
         var portfolio = PortfolioComposer.Compose(jdAnalyses);
         Console.WriteLine(PortfolioComposer.Describe(portfolio));
@@ -891,6 +936,100 @@ void PrintOutcomes(string function, AiSuggestion suggestion, IReadOnlyList<Provi
             Console.WriteLine("REJECTED unknown actions:");
             foreach (var a in outcome.UnknownActionsRejected) Console.WriteLine("  x " + a);
         }
+
+        // AN ACTION DROPPED WITHOUT A REASON IS THE WORST OUTPUT THIS TOOL CAN PRODUCE.
+        //
+        // The validator discards an action in three places besides "unknown": a task
+        // coverage contradiction, a citation that misquotes Microsoft, and an action the
+        // model never justified. Every one of those was invisible here — the desktop app
+        // renders them as cards, the CLI printed nothing, and the audit record stores
+        // nothing either.
+        //
+        // The cost was four rounds of investigation on one duty. The model chose
+        // microsoft.directory/users/disable, Stage D verified it, and the verdict read
+        // "Validated actions (0)" with an empty rejection list. The reason existed in the
+        // outcome object the whole time and reached nobody.
+        // Outcome.Contradicted already filters to the exclusions, and .Reason is the field
+        // the desktop app renders — worth reusing rather than re-deriving both.
+        if (outcome.Contradicted.Count > 0)
+        {
+            Console.WriteLine("EXCLUDED — cannot do what was asked:");
+            foreach (var c in outcome.Contradicted)
+                Console.WriteLine("  x " + c.Action + " — " + c.Reason);
+        }
+
+        if (outcome.FabricatedCitations.Count > 0)
+        {
+            Console.WriteLine("EXCLUDED — the quoted description is not Microsoft's:");
+            foreach (var c in outcome.FabricatedCitations)
+                Console.WriteLine("  x " + c.Action);
+        }
+
+        if (outcome.UncitedActions.Count > 0)
+        {
+            Console.WriteLine("EXCLUDED — proposed with no supporting description:");
+            foreach (var a in outcome.UncitedActions) Console.WriteLine("  x " + a);
+        }
+
+        // ================= WHAT THE VALIDATOR KNEW AND NOBODY SAW =================
+        //
+        // An audit of the outcome object found NINE computed fields that reached this
+        // command not at all, and five that reached neither interface — the desktop app has
+        // never rendered them either. Every one is a qualification on a verdict that was
+        // presented without it.
+        //
+        // This is the same fault that made the last three days expensive: the application
+        // knows something, reports nothing, and the operator reads a cleaner answer than
+        // the one that was actually computed.
+
+        // A PERMISSION MICROSOFT DOCUMENTS THAT NO ROLE HERE GRANTS. Not an error — it is
+        // precisely the case a custom role exists to solve — but the operator is approving
+        // something their tenant has never granted before.
+        if (outcome.ReferenceOnlyActions.Count > 0)
+        {
+            Console.WriteLine("DOCUMENTED BUT NOT GRANTED BY ANY ROLE IN THIS TENANT:");
+            foreach (var a in outcome.ReferenceOnlyActions) Console.WriteLine("  ? " + a);
+        }
+
+        // MICROSOFT REFUSES THESE IN CUSTOM ROLES, so a built-in is the only route and the
+        // excess it carries is unavoidable rather than a ranking failure.
+        if (outcome.CustomRoleBlockedActions.Count > 0)
+        {
+            Console.WriteLine("NOT ELIGIBLE FOR A CUSTOM ROLE (Microsoft refuses them):");
+            foreach (var a in outcome.CustomRoleBlockedActions) Console.WriteLine("  ! " + a);
+        }
+
+        // RECORDED FROM AN EARLIER REFUSAL in this tenant. Worth separating from the above:
+        // one is documented, the other is remembered, and a remembered refusal can be wrong.
+        if (outcome.CustomRoleRefusedActions.Count > 0)
+        {
+            Console.WriteLine("PREVIOUSLY REFUSED BY THIS TENANT in a custom role:");
+            foreach (var a in outcome.CustomRoleRefusedActions) Console.WriteLine("  ! " + a);
+        }
+
+        // THE THREE-STATE MACHINE'S MIDDLE STATE, INVISIBLE UNTIL NOW. "Not on the refused
+        // list" is not proof of eligibility — that distinction is why the state exists — and
+        // an operator approving a custom role could not tell a proven action from an
+        // unverified one.
+        if (outcome.EligibilityUnproven.Count > 0)
+        {
+            Console.WriteLine("UNPROVEN for a custom role — this tenant has never created one "
+                            + "with these, so Microsoft may still refuse:");
+            foreach (var a in outcome.EligibilityUnproven) Console.WriteLine("  ? " + a);
+        }
+
+        if (outcome.CustomRoleRuledOutByDocumentation)
+            Console.WriteLine("NOTE: Microsoft's documentation rules out a custom role here.");
+
+        // THE DOCUMENTED ANSWER DISAGREES WITH THE RANKED ONE. Either is defensible; being
+        // told only one of them is not.
+        if (outcome.DocumentedRoleMismatch && !string.IsNullOrWhiteSpace(outcome.DocumentedRoleName))
+            Console.WriteLine("NOTE: Microsoft documents '" + outcome.DocumentedRoleName +
+                              "' for this task, and it does not cover what was proposed.");
+
+        if (outcome.DocumentedRolePromoted && !string.IsNullOrWhiteSpace(outcome.DocumentedRoleName))
+            Console.WriteLine("NOTE: '" + outcome.DocumentedRoleName +
+                              "' was preferred because Microsoft documents it for this task.");
         if (outcome.CustomRoleRecommended && outcome.CustomRole is not null)
         {
             Console.WriteLine("VERDICT: CUSTOM ROLE -> '" + outcome.CustomRole.DisplayName +
@@ -950,13 +1089,35 @@ RoleCatalog LoadCatalog(string? path = null)
     // still carrying nothing after both passes are invisible to every later stage, and a
     // provider that is invisible produces answers from a different service — which is how
     // a request to purge phishing mail came back with Remove-Mailbox.
-    var docs = PurviewRoleCatalog.Load(purviewRolesPath);
+    var docs = PurviewRoleCatalog.LoadOrImport(purviewRolesPath, purviewRolesMarkdownPath);
     if (!docs.IsEmpty)
     {
         var filled = docs.EnrichCatalog(loaded);
         if (filled > 0)
+        {
             Console.WriteLine("(Purview: " + filled + " role(s) described from Microsoft's " +
                               "published role list.)");
+
+            // PERSIST WHAT THE APPLICATION ACTUALLY USES.
+            //
+            // Enrichment ran on every launch and was never saved, so catalog.json held 122
+            // Purview roles with ZERO permissions while the process held 114 with
+            // vocabulary. Every diagnostic anyone ran read the file and reported the service
+            // as empty; the application meanwhile answered Purview requests correctly. Days
+            // were spent on that contradiction.
+            //
+            // A file that disagrees with the running application is worse than a missing
+            // one: it answers the question confidently and wrongly. Saving also means the
+            // 114-role parse and merge happen once rather than on every process start.
+            try
+            {
+                if (File.Exists(catalogPath)) loaded.Save(catalogPath);
+            }
+            catch (Exception)
+            {
+                // A failed save costs a re-parse next launch. Not worth interrupting anyone.
+            }
+        }
     }
 
     // SAY WHAT IS ACTUALLY MISSING. The first version of this claimed the service could
@@ -973,6 +1134,18 @@ RoleCatalog LoadCatalog(string? path = null)
                           " role(s) have vocabulary. The other " + silent +
                           " cannot be recommended — run dist\\import-purview-roles.ps1 to " +
                           "describe them from Microsoft's published list.)");
+    }
+
+    // THE CHECK NO INDIVIDUAL SYNC STEP IS IN A POSITION TO MAKE. Each step knows whether
+    // it succeeded; none of them knows whether the result looks like usable data. Every
+    // expensive bug in this application has been a step succeeding and producing something
+    // nothing downstream could use.
+    var health = CatalogHealth.Check(loaded);
+    if (health.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine(CatalogHealth.Describe(health));
+        Console.WriteLine();
     }
 
     return loaded;

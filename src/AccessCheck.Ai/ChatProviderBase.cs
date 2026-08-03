@@ -34,6 +34,37 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
     protected abstract Task<string> SendChatAsync(string system, string user, CancellationToken ct);
 
     /// <summary>
+    /// An optional response cache. When set, an identical question is answered from it
+    /// rather than asked again.
+    /// </summary>
+    public PromptCache? Cache { get; set; }
+
+    /// <summary>
+    /// Every stage goes through here rather than calling the transport directly.
+    ///
+    /// THE ENDPOINT WILL NOT BE DETERMINISTIC. temperature 0, top_p 1 and a fixed seed were
+    /// all set and identical runs still diverged — the decomposer split one job description
+    /// into "joiners, movers, and leavers" on one pass and "joiners, movers and leavers" on
+    /// the next, and every answer downstream moved with it. Commercial endpoints batch,
+    /// route across experts, and accumulate floating point in hardware order; seed is
+    /// documented as best-effort. There is no client-side setting that fixes this.
+    ///
+    /// So reproducibility is taken here instead. The same question returns the same answer,
+    /// which is what makes a recommendation reviewable — and what lets an auditor asking
+    /// "how was this reached" get the actual answer rather than a fresh one that happens to
+    /// resemble it.
+    /// </summary>
+    protected async Task<string> SendCachedAsync(string system, string user, CancellationToken ct)
+    {
+        if (Cache is not null && Cache.TryGet(Config.Model, system, user, out var cached))
+            return cached;
+
+        var response = await SendChatAsync(system, user, ct);
+        Cache?.Put(Config.Model, system, user, response);
+        return response;
+    }
+
+    /// <summary>
     /// This transport's web-search tool declaration, or null when it has none.
     ///
     /// EVERY VENDOR SPELLS THIS DIFFERENTLY and some endpoints have no search at all — a
@@ -106,7 +137,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
             PromptLogger?.Invoke("service", serviceUser);
             try
             {
-                var raw = StripFences(await SendChatAsync(PromptBuilder.ServiceSystem, serviceUser, ct));
+                var raw = StripFences(await SendCachedAsync(PromptBuilder.ServiceSystem, serviceUser, ct));
                 using var doc = JsonDocument.Parse(raw);
                 if (doc.RootElement.TryGetProperty("services", out var arr) &&
                     arr.ValueKind == JsonValueKind.Array)
@@ -193,6 +224,118 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
             };
         }
 
+        // ---- Stage B2: ask what the task NEEDS, then make sure it is on offer ----
+        //
+        // Stage B decides what the model is ALLOWED to pick, by keyword score with a cap
+        // per provider. Nothing downstream can recover a permission that was never shown:
+        // the validator, the guards and the verifier all reason about what came back, not
+        // about what was available. So a scoring miss is invisible everywhere and surfaces
+        // only as a plausible wrong answer, or as silence.
+        //
+        // It missed repeatedly. Identical runs of one job description resolved
+        // search-and-purge from Purview once and returned nothing the next; users/create
+        // was offered to one duty and withheld from the adjacent one; a mailbox-delegation
+        // request reached a Microsoft 365 BACKUP permission because that was the only
+        // candidate whose name contained "mailbox".
+        //
+        // This stage asks the model what the task needs WITHOUT showing it a list, then
+        // looks each named permission up. Anything real that scoring had missed is added
+        // to the candidates. Nothing is granted on the model's say-so — a name that
+        // matches nothing in the catalog or the reference is recorded and discarded, which
+        // is the same rule the validator applies afterwards.
+        var namedNeeds = await NamePermissionsAsync(functionDescription, ct);
+        var seededNote = "";
+        if (namedNeeds.Count > 0)
+        {
+            var index = PermissionIndex.Build(catalog, reference);
+            var have = candidates.Select(c => c.Action).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var seeded = new List<string>();
+            var unknown = new List<string>();
+
+            foreach (var name in namedNeeds)
+            {
+                var match = index.Entries.FirstOrDefault(e =>
+                    e.Action.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+                // A cmdlet is often named without its switch — "New-ComplianceSearchAction"
+                // for an entry stored as "New-ComplianceSearchAction -Purge". Match the
+                // base name so the switch variants are offered rather than missed.
+                match ??= index.Entries.FirstOrDefault(e =>
+                    e.Action.StartsWith(name + " ", StringComparison.OrdinalIgnoreCase));
+
+                if (match is null)
+                {
+                    // A GRAPH SCOPE IS NOT A MISSING RBAC ACTION. User.ReadWrite.All and
+                    // DeviceManagementManagedDevices.Read.All are what an APPLICATION
+                    // consents to — a different permission system that cannot be granted to
+                    // a person through a role. Reporting one as absent from the catalog
+                    // sends an operator hunting for something that was never going to be
+                    // there, and the prompt forbidding it is guidance rather than a
+                    // guarantee.
+                    if (LooksLikeGraphScope(name)) continue;
+                    unknown.Add(name);
+                    continue;
+                }
+
+                // A PERMISSION IN THE WRONG SERVICE IS STILL A REAL PERMISSION.
+                //
+                // This used to refuse anything outside the identified service. That refusal
+                // did direct harm: a duty to search for and REMOVE malicious messages had
+                // New-ComplianceSearch and New-ComplianceSearchAction -Purge named
+                // correctly, both present in Purview, and both discarded because the service
+                // stage had said Exchange Online — a reading the pipeline then overturned
+                // two steps later. What survived was a role that could only EXPORT the
+                // messages. The duty was to delete them.
+                //
+                // The service stage is a hint, not a verdict, and it is wrong often enough
+                // that acting on it destructively is worse than the crowding it prevents.
+                // Seeding a candidate widens only what may be CONSIDERED — the validator
+                // partitions by provider afterwards, and the service reconciliation already
+                // requires positive evidence from the cmdlet map before overriding. So note
+                // the mismatch and let the deterministic layers decide.
+                var outsideIdentified = services.Count > 0 &&
+                    !services.Contains(match.Provider, StringComparer.OrdinalIgnoreCase);
+
+                // CANDIDATE SCORING IS NOT THE ONLY DOOR. PermissionIndex withholds
+                // agent-identity permissions from a request about staff accounts, because
+                // the model conflates agentUsers with users relentlessly. This stage looks
+                // permissions up BY NAME against the whole index, so it walked straight
+                // past that filter: a duty to disable user accounts named
+                // agentUsers/disable, it was found, seeded, chosen, and then stripped by
+                // the verifier — leaving the duty with no answer at all.
+                //
+                // One rule, applied at both doors.
+                if (PermissionIndex.IsSpecialisedIdentity(match.Action) &&
+                    !PermissionIndex.RequestMentionsSpecialisedIdentity(functionDescription))
+                    continue;
+
+                if (have.Add(match.Action))
+                {
+                    candidates.Add(match);
+                    seeded.Add(match.Action + (outsideIdentified
+                        ? " (" + RbacProviders.DisplayName(match.Provider) + ")" : ""));
+                }
+            }
+
+            if (seeded.Count > 0)
+                seededNote += "  [AccessCheck: " + seeded.Count + " permission(s) the task "
+                    + "needs were added to the candidate list after keyword scoring missed "
+                    + "them — " + string.Join(", ", seeded.Take(4)) + ".]";
+
+            // NAMED AND ABSENT IS A FINDING, NOT A SHRUG. "This needs X, which your catalog
+            // does not have" is actionable; silently proposing the nearest wrong thing is
+            // how Remove-Mailbox was offered for a request to delete messages.
+            if (unknown.Count > 0)
+                seededNote += "  [AccessCheck: the task appears to need " +
+                    string.Join(", ", unknown.Take(4)) +
+                    ", which is not in your synced catalog or Microsoft's reference for the "
+                    + "identified service. Nothing was substituted.]";
+
+            PromptLogger?.Invoke("needs-result",
+                "named: " + string.Join(", ", namedNeeds) + "\nseeded: " +
+                string.Join(", ", seeded) + "\nnot found: " + string.Join(", ", unknown));
+        }
+
         // ---- Stage C: choose ----
         var permissionUser = PromptBuilder.BuildPermissionUser(functionDescription, candidates);
         PromptLogger?.Invoke("permissions", permissionUser);
@@ -227,7 +370,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
                 var widerUser = PromptBuilder.BuildPermissionUser(functionDescription, wider);
                 PromptLogger?.Invoke("permissions-widened", widerUser);
                 var widerRaw = StripFences(
-                    await SendChatAsync(PromptBuilder.PermissionSystem, widerUser, ct));
+                    await SendCachedAsync(PromptBuilder.PermissionSystem, widerUser, ct));
                 var widerParsed = ParseSuggestion(widerRaw);
                 var widerActions = wider.Select(c => c.Action).ToList();
                 foreach (var proposed in widerParsed.RequiredActions)
@@ -341,6 +484,8 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
                 "confidently. Verify before granting.]";
         }
 
+        reasoning += seededNote;
+
         // ---- Stage D: verification ----
         var verdicts = await VerifyAsync(functionDescription, kept, reference, ct);
         var wrongTarget = verdicts
@@ -389,6 +534,128 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
         };
     }
 
+    // ================= STAGE B2: what does this NEED? =================
+
+    /// <summary>
+    /// Noun.Verb.All — the shape of a Graph API application scope. Distinguished from an
+    /// RBAC action by having no slash and no hyphen: actions are paths
+    /// (microsoft.directory/users/create) and cmdlets are hyphenated verbs
+    /// (Add-MailboxPermission). Nothing in either vocabulary looks like this.
+    /// </summary>
+    private static bool LooksLikeGraphScope(string name)
+    {
+        if (name.Contains('/') || name.Contains('-') || name.Contains(' ')) return false;
+
+        var parts = name.Split('.');
+        if (parts.Length < 2) return false;
+
+        var last = parts[^1];
+        return last.Equals("All", StringComparison.OrdinalIgnoreCase)
+            || last.Equals("Read", StringComparison.OrdinalIgnoreCase)
+            || last.Equals("ReadWrite", StringComparison.OrdinalIgnoreCase)
+            || last.Equals("ReadBasic", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private const string NeedsSystem = """
+        You name the Microsoft 365 or Azure permissions a task requires. Nothing more.
+
+        You are NOT choosing from a list and you will NOT be shown one. Name what the task
+        actually needs, using Microsoft's own naming as precisely as you can recall it:
+
+          microsoft.directory/users/password/update
+          Add-MailboxFolderPermission
+          New-ComplianceSearchAction -Purge
+          Microsoft.Intune_DeviceCompliancePolices_Create
+
+        RULES
+
+        RBAC ACTIONS AND CMDLETS ONLY. These are NOT the same thing as Graph API permission
+        scopes, and naming one where the other is wanted is the commonest mistake here.
+
+          WANTED    microsoft.directory/users/password/update
+          NOT       User.ReadWrite.All
+
+          WANTED    Microsoft.Intune_DeviceCompliancePolices_Read
+          NOT       DeviceManagementManagedDevices.Read.All
+
+        A scope of the form Noun.Verb.All is what an APPLICATION consents to. It is a
+        different permission system and cannot be granted to a person through a role. If the
+        only thing you can recall is a scope of that shape, name nothing.
+
+        NAME PERMISSIONS, NOT ROLES. "DLP Compliance Management" and "User Administrator" are
+        role NAMES. A role is a bundle of the permissions being asked for; naming it answers
+        a different question and will be reported as a permission your catalog is missing.
+
+        NAME THE NARROWEST THING THAT DOES THE JOB. Not the role that contains it, not the
+        whole service. If a task needs one cmdlet, name one cmdlet.
+
+        NAME THE OPERATION ON THE RIGHT OBJECT. Deleting a MESSAGE is not deleting the
+        MAILBOX that holds it. Disabling a USER is not disabling an AGENT user. Managing
+        group MEMBERSHIP is not creating an access REVIEW of it. Getting this wrong is the
+        single most damaging mistake here, because the wrong answer executes successfully.
+
+        SAY SO WHEN YOU DO NOT KNOW. An empty list is a useful answer. A guessed permission
+        name is not — it will be looked up, found not to exist, and reported to an operator
+        as a gap in their catalog, when it is really a gap in your recall. Half-remembering
+        that a permission "probably looks something like" a name is not recall. Name it only
+        if you would expect to find that exact string in Microsoft's documentation.
+
+        DO NOT PAD. Three permissions that do the task beat eight that surround it.
+
+        NAME NOTHING FOR A DUTY THAT IS NOT ABOUT ACCESS — writing documentation, chairing
+        a meeting, being on call. Return an empty list.
+
+        Return ONLY: {"permissions":["...","..."]}
+        No prose, no markdown fences.
+        """;
+
+    /// <summary>
+    /// Asks what the task needs, with no candidate list in front of the model.
+    ///
+    /// The constrained stage answers a different question — "which of these 60 is closest?"
+    /// — and cannot report that the right permission was absent, because it has no way to
+    /// know. Asking openly first turns a scoring miss from an invisible truncation into
+    /// either a permission that gets offered after all, or a stated finding.
+    ///
+    /// The model is NOT trusted with the answer. Every name is looked up in the catalog and
+    /// Microsoft's reference; anything that matches nothing is discarded and reported. This
+    /// widens what can be CONSIDERED without widening what can be GRANTED, which stays
+    /// exactly where it was: the tenant's own vocabulary, checked by deterministic code.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> NamePermissionsAsync(
+        string functionDescription, CancellationToken ct = default)
+    {
+        var user = "TASK: " + Truncate(functionDescription, 2000);
+        PromptLogger?.Invoke("needs", user);
+
+        try
+        {
+            var raw = StripFences(await SendCachedAsync(NeedsSystem, user, ct));
+            var json = ExtractJsonObject(raw) ?? raw;
+
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("permissions", out var arr) ||
+                arr.ValueKind != JsonValueKind.Array)
+                return Array.Empty<string>();
+
+            return arr.EnumerateArray()
+                .Select(e => e.GetString() ?? "")
+                .Select(x => x.Trim())
+                .Where(x => x.Length > 0)
+                // A recalled name longer than this is prose, not an action string.
+                .Where(x => x.Length < 200)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(12)
+                .ToList();
+        }
+        catch (Exception)
+        {
+            // THIS STAGE ONLY EVER ADDS. If it fails, the request proceeds on the candidate
+            // list exactly as before — a degraded answer, never a wrong one.
+            return Array.Empty<string>();
+        }
+    }
+
     // ================= STAGE D: verification =================
 
     public enum VerifyVerdict
@@ -426,6 +693,21 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
           Task: "remove malicious messages from mailboxes"
           Permission: Remove-Mailbox
           -> WRONG_TARGET. It deletes the entire mailbox, not messages within it.
+
+        A NAMED OPERATION NEEDS AN ACTION THAT NAMES IT. Where the task names an operation
+        — disable, enable, delete, reset, retire, purge, revoke, restore — a general
+        "update" on the same object is NOT that operation, however broad the update sounds.
+        Microsoft models them separately precisely because changing a property is not the
+        same as changing state.
+
+          Task: "disable user accounts"
+          Permission: microsoft.directory/users/basic/update
+          -> WRONG_TARGET. It updates basic properties — display name, job title,
+             department. Disabling is microsoft.directory/users/disable, a separate action.
+
+        This is the failure that reaches an approver looking most reasonable, so it is worth
+        being strict about: reasoning that an update "includes" the named operation is
+        exactly the guess this check exists to refuse.
 
           Task: "create user accounts"
           Permission: microsoft.directory/users/basic/update
@@ -500,7 +782,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
 
             try
             {
-                var raw = StripFences(await SendChatAsync(VerifySystem, user, ct));
+                var raw = StripFences(await SendCachedAsync(VerifySystem, user, ct));
                 var json = ExtractJsonObject(raw) ?? raw;
 
                 using var doc = JsonDocument.Parse(json);
@@ -699,7 +981,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
         var user = "DOCUMENT:\n" + Truncate(trimmed, 12000);
         PromptLogger?.Invoke("decompose", user);
 
-        var raw = StripFences(await SendChatAsync(DecomposeSystem, user, ct));
+        var raw = StripFences(await SendCachedAsync(DecomposeSystem, user, ct));
         var json = ExtractJsonObject(raw) ?? raw;
 
         var results = new List<FunctionSpec>();
@@ -759,7 +1041,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
         string stage, string system, string user, CancellationToken ct = default)
     {
         PromptLogger?.Invoke(stage, user);
-        return StripFences(await SendChatAsync(system, user, ct));
+        return StripFences(await SendCachedAsync(system, user, ct));
     }
 
     // ---------- shared parsing ----------
@@ -880,7 +1162,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
     /// </summary>
     private async Task<AiSuggestion> ChooseWithRetryAsync(string permissionUser, CancellationToken ct)
     {
-        var raw = StripFences(await SendChatAsync(PromptBuilder.PermissionSystem, permissionUser, ct));
+        var raw = StripFences(await SendCachedAsync(PromptBuilder.PermissionSystem, permissionUser, ct));
         try
         {
             return ParseSuggestion(raw);
@@ -896,7 +1178,7 @@ public abstract class ChatProviderBase : IRecommendationProvider, IDisposable
                 + "markdown. Start your reply with { and end it with }.";
 
             var retryRaw = StripFences(
-                await SendChatAsync(PromptBuilder.PermissionSystem, retryUser, ct));
+                await SendCachedAsync(PromptBuilder.PermissionSystem, retryUser, ct));
             return ParseSuggestion(retryRaw);
         }
     }

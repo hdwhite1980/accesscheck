@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using AccessCheck.Core.Catalog;
 using AccessCheck.Core.Recommendation;
@@ -188,9 +188,24 @@ public static class PromptBuilder
             return "[no Microsoft description; " + viaRoles + "]";
         }
 
-        // One line, so a long role summary does not swamp the candidate list.
+        // ONE LINE — a long role summary swamps a list of two hundred candidates.
         var firstSentence = text.Split(new[] { ". " }, StringSplitOptions.None)[0].Trim();
         if (firstSentence.Length > 160) firstSentence = firstSentence[..160].TrimEnd() + "...";
+
+        // THE NOTE IS ADDED HERE AND NOWHERE ELSE.
+        //
+        // Where two permissions are routinely confused, Microsoft's own sentence is accurate
+        // and not enough to tell them apart: "Disable users" beside "Update basic properties
+        // on users" reads as though the second is broader and covers the first, and a duty
+        // to disable accounts was answered with the property update run after run.
+        //
+        // Written into the description it fixed that and broke CitationCheck, which compares
+        // the description the model quoted against the one this application holds — so a
+        // model quoting an annotated description faithfully was judged to have invented it.
+        // Adding it at render time keeps Microsoft's description exactly Microsoft's for
+        // every other consumer, known and future.
+        var note = ActionNoteStore.NoteFor(entry.Action);
+        if (note.Length > 0) firstSentence += "  AccessCheck note: " + note;
 
         var roles = entry.GrantedByRoles.Count > 0
             ? "  [granted by " + string.Join(", ", entry.GrantedByRoles.Take(2)) + "]"

@@ -278,6 +278,42 @@ public sealed class PermissionIndex
     /// matched agentUsers and guestUsers as strongly as users, and "groups" matched
     /// groups.security, groups.unified and accessReviews/definitions.groups alike.
     /// </summary>
+    /// <summary>
+    /// Whether the request is actually about agent or workload identities. Shared so the
+    /// scoring filter and the needs stage cannot disagree about when the gate opens.
+    /// </summary>
+    public static bool RequestMentionsSpecialisedIdentity(string functionDescription)
+    {
+        var lower = functionDescription.ToLowerInvariant();
+        return lower.Contains("agent", StringComparison.Ordinal)
+            || lower.Contains("service principal", StringComparison.Ordinal)
+            || lower.Contains("workload identit", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Identity types that are NOT ordinary user accounts, however similar their action
+    /// names look. Kept deliberately short — this suppresses candidates, so anything listed
+    /// here becomes unreachable for a request that does not name it.
+    /// </summary>
+    private static readonly string[] SpecialisedIdentitySegments =
+    {
+        "agentusers"
+    };
+
+    /// <summary>
+    /// True when this action belongs to a specialised identity type rather than to ordinary
+    /// user accounts. Public because CANDIDATE SCORING IS NOT THE ONLY DOOR — the
+    /// open-ended needs stage looks permissions up by name against the whole index, so a
+    /// filter applied only to scoring let the model name agentUsers/disable and have it
+    /// seeded straight back in.
+    /// </summary>
+    public static bool IsSpecialisedIdentity(string action)
+    {
+        var segments = action.ToLowerInvariant()
+            .Split(new[] { '/', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
+        return segments.Any(seg => SpecialisedIdentitySegments.Contains(seg, StringComparer.Ordinal));
+    }
+
     internal static bool SegmentMatches(string action, string word)
     {
         var segments = action.Split(new[] { '/', '_', '.', '-', ' ' },
@@ -370,6 +406,10 @@ public sealed class PermissionIndex
         // model cannot pick what it is not shown.
         var wantsChange = RequestWantsStateChange(functionDescription);
 
+        // Whether the request is about agent identities at all. Checked once per request
+        // rather than per candidate.
+        var mentionsSpecialisedIdentity = RequestMentionsSpecialisedIdentity(functionDescription);
+
         var scored = new List<(PermissionEntry Entry, int Score)>();
         foreach (var entry in index.Entries)
         {
@@ -384,6 +424,23 @@ public sealed class PermissionIndex
             var name = entry.Action.ToLowerInvariant();
             var haystack = (entry.Action + " " + entry.Description + " " +
                             string.Join(" ", entry.GrantedByRoles)).ToLowerInvariant();
+
+            // A SPECIALISED OBJECT TYPE THE REQUEST DID NOT ASK FOR IS NOISE.
+            //
+            // agentUsers are identities for AI agents, not staff, and their action list
+            // mirrors the real one almost exactly — create, delete, disable, manager/update,
+            // photo/update. The model conflates them relentlessly: one duty to AMEND user
+            // accounts came back proposing eight agentUsers permissions, all of which the
+            // verifier then had to strip, and a duty to DISABLE user accounts was left with
+            // nothing at all once its single agentUsers proposal was removed.
+            //
+            // Segment scoring does not solve this — users/* already outranks agentUsers/*,
+            // and the model picked the latter regardless with both in front of it. So the
+            // fix is to stop offering them unless the request is actually about agents.
+            //
+            // Gated on the request rather than removed outright: a genuine request to manage
+            // agent identities must still be answerable.
+            if (IsSpecialisedIdentity(entry.Action) && !mentionsSpecialisedIdentity) continue;
 
             var score = 0;
             foreach (var word in words)
@@ -467,13 +524,46 @@ public sealed class PermissionIndex
             .Where(w => w.Length > 2)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // THE SAME GATE AS CandidateActions, AND THIS IS THE PATH THAT MATTERS MORE.
+        //
+        // The filter was added to CandidateActions only, but once a service has been
+        // identified the pipeline comes through HERE — so a duty to disable user accounts
+        // took the ungated path, agentUsers/disable was offered, and the model took it.
+        //
+        // Worse than being offered: agentUsers sorts BEFORE users alphabetically, so on
+        // equal keyword hits and equal breadth it wins the tie and takes the slot. The
+        // correct permission, microsoft.directory/users/disable, sat in the catalog and
+        // never appeared in a single prompt.
+        //
+        // One rule, three doors: scoring, service-scoped listing, and the needs stage.
+        var mentionsSpecialisedIdentity = RequestMentionsSpecialisedIdentity(functionDescription);
+
         var result = new List<PermissionEntry>();
         foreach (var provider in providers)
         {
             var forProvider = index.Entries
                 .Where(e => e.Provider.Equals(provider, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(e => words.Any(w =>
-                    e.Action.Contains(w, StringComparison.OrdinalIgnoreCase)))   // keyword hits first
+                .Where(e => mentionsSpecialisedIdentity || !IsSpecialisedIdentity(e.Action))
+                // HOW MANY WORDS MATCH, AND HOW WELL — NOT WHETHER ANY DOES.
+                //
+                // This was a boolean: one match ranked identically to five. Every
+                // microsoft.directory/users/* action contains "user", so on a request about
+                // user accounts thousands of actions tied at true and the real ordering
+                // fell through to breadth, privilege, then ALPHABETICAL. In a provider with
+                // 145 roles that exhausts 220 slots long before the letter d.
+                //
+                // microsoft.directory/users/disable therefore never appeared in a single
+                // prompt, across every run in the log, while users/basic/update survived
+                // purely because "basic" sorts early. The model kept answering a disable
+                // request with a property update because that was the only one of the two
+                // it was ever shown — and every fix aimed at helping it CHOOSE better was
+                // aimed at a stage that had nothing correct to choose.
+                //
+                // A whole-segment match is the strong signal: "disable" IS a segment of
+                // users/disable, whereas "user" merely appears inside hundreds of others.
+                .OrderByDescending(e => words.Count(w => SegmentMatches(e.Action, w)) * 3
+                                      + words.Count(w =>
+                                          e.Action.Contains(w, StringComparison.OrdinalIgnoreCase)))
                 .ThenBy(e => PermissionBreadth.Classify(e.Action))               // narrowest first
                 .ThenBy(e => e.IsPrivileged)                                     // reads before writes
                 .ThenBy(e => e.Action, StringComparer.OrdinalIgnoreCase)

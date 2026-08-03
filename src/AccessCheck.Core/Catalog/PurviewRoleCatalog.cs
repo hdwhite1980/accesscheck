@@ -289,6 +289,43 @@ public sealed class PurviewRoleCatalog
 
     // ---------- persistence ----------
 
+    /// <summary>
+    /// Loads the parsed cache, or builds it from Microsoft's markdown the first time.
+    ///
+    /// The import downloads a markdown page; every consumer wants a parsed catalog. Nothing
+    /// connected the two, so the app looked for a JSON file that was never written and
+    /// silently fell back to the eight hand-mapped roles — the exact degraded state the
+    /// import exists to fix, reached without an error anywhere.
+    ///
+    /// Shipping the MARKDOWN rather than the JSON is deliberate. It is the artefact
+    /// Microsoft actually publishes, it is diffable when they revise it, and parsing it here
+    /// means the parser and the data can never drift apart in the package. Anyone who drops
+    /// a fresher copy of the page into the data folder gets it used, with no conversion step
+    /// to remember.
+    /// </summary>
+    public static PurviewRoleCatalog LoadOrImport(string jsonPath, string markdownPath)
+    {
+        var cached = Load(jsonPath);
+        if (!cached.IsEmpty) return cached;
+
+        if (!File.Exists(markdownPath)) return cached;
+
+        try
+        {
+            var parsed = ParseLearnMarkdown(File.ReadAllText(markdownPath), markdownPath);
+            if (parsed.IsEmpty) return cached;
+
+            // Cache it so the parse happens once rather than on every launch. A failure to
+            // write is not a failure to work — the catalog is already in hand.
+            try { parsed.Save(jsonPath); } catch (Exception) { }
+            return parsed;
+        }
+        catch (Exception)
+        {
+            return cached;
+        }
+    }
+
     public static PurviewRoleCatalog Load(string path)
     {
         if (!File.Exists(path)) return new PurviewRoleCatalog();

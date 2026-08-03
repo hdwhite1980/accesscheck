@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -8,9 +8,9 @@
     <AssemblyName>AccessCheck</AssemblyName>
     <RootNamespace>AccessCheck.App</RootNamespace>
     <ApplicationIcon>..\..\dist\Assets\AccessCheck.ico</ApplicationIcon>
-    <Version>0.77.0</Version>
-    <FileVersion>0.77.0.0</FileVersion>
-    <AssemblyVersion>0.77.0.0</AssemblyVersion>
+    <Version>0.78.0</Version>
+    <FileVersion>0.78.0.0</FileVersion>
+    <AssemblyVersion>0.78.0.0</AssemblyVersion>
     <Product>AccessCheck</Product>
     <Company>Accelerated Hues Technology Services LLC</Company>
     <Description>Least-privilege access broker for Microsoft 365 and Azure.</Description>
@@ -22,5 +22,21 @@
     <ProjectReference Include="..\AccessCheck.Ai\AccessCheck.Ai.csproj" />
     <ProjectReference Include="..\AccessCheck.Graph\AccessCheck.Graph.csproj" />
     <ProjectReference Include="..\AccessCheck.PowerShell\AccessCheck.PowerShell.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- REFERENCE DATA NO TENANT CAN PRODUCE FOR ITSELF.
+         Microsoft exposes no Purview role CONTENTS through any API — the Security and
+         Compliance session has no Get-ManagementRoleEntry and Get-ManagementRole returns an
+         empty RoleEntries — and Exchange Online's REST mode generates proxy cmdlets that
+         carry no help text, so Get-Help returns an empty synopsis for every one.
+         Without these two files a fresh install holds vocabulary for 8 Purview roles out of
+         120 and reads Exchange cmdlet names with nothing to check them against, which is how
+         a request to delete MESSAGES came back with Remove-Mailbox. Both are identical for
+         every tenant, so they ship in the package and SeedData copies them out on first run.
+         Populate the folder with dist\refresh-bundled-data.ps1 before building a release. -->
+    <Content Include="data\**\*.json;data\**\*.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 </Project>

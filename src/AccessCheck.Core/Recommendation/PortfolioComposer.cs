@@ -38,6 +38,12 @@ public sealed record PortfolioGrant
     public required string Rationale { get; init; }
     /// <summary>Role labels this grant absorbed because it already contains everything they did.</summary>
     public IReadOnlyList<string> Supersedes { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// True when every duty behind this grant only looks at things. Kept so folding can
+    /// refuse to merge a read-only duty into a grant that writes.
+    /// </summary>
+    public bool ReadOnlyIntent { get; init; }
     public int RiskScore => ActionRisk.Score(Actions);
 
     public string Headline =>
@@ -226,6 +232,7 @@ public static class PortfolioComposer
 
                 return new PortfolioGrant
                 {
+                    ReadOnlyIntent = g.All(a => a.DeclaredReadOnly),
                     Provider = g.First().Provider,
                     RoleLabel = g.First().RoleLabel!,
                     CustomRole = g.Any(a => a.CustomRole),
@@ -289,6 +296,25 @@ public static class PortfolioComposer
                 if (!kept[i].Provider.Equals(candidate.Provider, StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                // A READ-ONLY DUTY DOES NOT FOLD INTO A GRANT THAT WRITES.
+                //
+                // Containment made this legal and it produced a real over-grant: a duty to
+                // produce monthly licence REPORTING resolved to assignLicense, whose action
+                // was a subset of the account-amendment grant, so the two merged. Approving
+                // "monthly licence reporting" then also granted the ability to change
+                // licences, reassign managers and edit user properties — the invisible
+                // over-grant this application exists to prevent, produced by the
+                // application rather than inherited from the model.
+                //
+                // Every other layer already treats read and write as different in kind:
+                // TaskCoverage rejects a read offered for a write task, ActionRisk weights
+                // them 1 against 3, LifetimeFor splits STANDING from TIME-BOXED on exactly
+                // this line. Folding across it was the inconsistency.
+                //
+                // The cost is more grants where one would have done. That is the safe
+                // direction: an extra grant is reviewed, an absorbed one is not.
+                if (candidate.ReadOnlyIntent && !kept[i].ReadOnlyIntent) continue;
+
                 var hostActions = kept[i].Actions.ToHashSet(StringComparer.OrdinalIgnoreCase);
                 if (candidate.Actions.All(hostActions.Contains)) { host = i; break; }
             }
@@ -306,6 +332,8 @@ public static class PortfolioComposer
 
             kept[i] = kept[i] with
             {
+                // Absorbing a write duty into a read-only grant would make the label a lie.
+                ReadOnlyIntent = kept[i].ReadOnlyIntent && absorbed.All(a => a.ReadOnlyIntent),
                 Duties = kept[i].Duties
                     .Concat(absorbed.SelectMany(a => a.Duties))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -341,10 +369,23 @@ public static class PortfolioComposer
     // microsoft.directory/groups.security/members/update — never "groups/members" — so a
     // literal marker for the unqualified form matched nothing, and the escalation pair
     // went unreported on a portfolio that contained it. Match the members segment itself.
+    /// <summary>
+    /// Membership of groups that can CARRY PRIVILEGE. Not every group can.
+    ///
+    /// Add-DistributionGroupMember matched a looser "groupmember" marker and produced a
+    /// blocking escalation finding against a request to manage MAIL LISTS. A distribution
+    /// list grants access to nothing — adding someone to it cannot be half of a privilege
+    /// escalation, and a blocking concern that is wrong teaches operators to dismiss the
+    /// ones that are right.
+    ///
+    /// Role groups and security groups stay in: Add-RoleGroupMember and
+    /// groups.security/members/update both place a principal somewhere that carries
+    /// permissions.
+    /// </summary>
     private static readonly string[] GroupMembershipMarkers =
     {
         "/members/update", "/members/allproperties", "/owners/update",
-        "groupmember", "add-rolegroupmember", "groups/allproperties"
+        "groups/allproperties", "add-rolegroupmember", "remove-rolegroupmember"
     };
 
     private static bool AnyMatches(IEnumerable<string> actions, string[] markers) =>

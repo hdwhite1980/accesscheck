@@ -1,4 +1,4 @@
-namespace AccessCheck.Core.Recommendation;
+﻿namespace AccessCheck.Core.Recommendation;
 
 /// <summary>
 /// Classifies a resource action as read-only or write/administrative, so ranking can
@@ -149,6 +149,16 @@ public static class ActionRisk
         "_remotetasks", "_wipe", "_retire"
     };
 
+    /// <summary>
+    /// Words that make a ROLE name read-only. Deliberately short: a role called
+    /// "Reader" or "Viewer" is unambiguous, whereas "Analyst" or "Investigator" routinely
+    /// carry write capability in Purview and must keep the cautious default.
+    /// </summary>
+    private static readonly string[] RoleNameReadWords =
+    {
+        "reader", "read-only", "read only", "viewer", "view-only", "view only"
+    };
+
     private static readonly string[] ReadPrefixes =
     {
         "get-", "search-", "test-", "export-", "measure-"
@@ -195,6 +205,30 @@ public static class ActionRisk
         {
             foreach (var p in ReadPrefixes) if (a.StartsWith(p, StringComparison.Ordinal)) return false;
             foreach (var p in WritePrefixes) if (a.StartsWith(p, StringComparison.Ordinal)) return true;
+        }
+
+        // PURVIEW ROLE NAMES ARE ACTIONS HERE, AND THEY ARE ENGLISH.
+        //
+        // Microsoft exposes no Purview role CONTENTS through any API, so the catalog stores
+        // each role as a single action carrying its own name — "License Usage Reader",
+        // "DLP Compliance Management". Those match none of the shapes below, so the
+        // unknown-means-privileged default caught every one of them and rated a READER role
+        // as an escalation route.
+        //
+        // The cost is not only the wrong number. It made the STANDING / TIME-BOXED / ON
+        // REQUEST distinction meaningless across the whole of Purview, and a card reading
+        // "License Usage Reader — escalation-capable" is exactly the visible nonsense that
+        // teaches an approver to stop reading the classification — which then costs the
+        // times it is right.
+        //
+        // Only role-shaped strings reach this: contains a SPACE, and no path or Intune
+        // punctuation. The space is what separates a role name from a cmdlet — Get-Mailbox
+        // has none — so excluding hyphens as well was redundant AND wrong: "View-Only Audit
+        // Logs" and "Read-Only Recipients" are exactly the roles this rule exists for.
+        if (a.Contains(' ') && !a.Contains('/') && !a.Contains('_'))
+        {
+            foreach (var word in RoleNameReadWords)
+                if (a.Contains(word, StringComparison.Ordinal)) return false;
         }
 
         // Explicit read endings are the strongest read signal.

@@ -127,6 +127,63 @@ public class PortfolioComposerTests
     }
 
     [Fact]
+    public void AReadOnlyDutyDoesNotFoldIntoAGrantThatWrites()
+    {
+        // THE OVER-GRANT THIS APPLICATION EXISTS TO PREVENT, produced by the application.
+        // Licence REPORTING resolved to assignLicense, whose action was contained in the
+        // account-amendment grant, so containment merged them — and approving "monthly
+        // licence reporting" also granted the ability to change licences and edit users.
+        var analyses = new[]
+        {
+            Duty("amend user accounts", RbacProviders.Directory, "AC - manage users",
+                 "microsoft.directory/users/basic/update",
+                 "microsoft.directory/users/assignLicense"),
+            Duty("produce monthly licence reporting", RbacProviders.Directory,
+                 "AC - assignLicense users",
+                 "microsoft.directory/users/assignLicense") with { DeclaredReadOnly = true }
+        };
+
+        var portfolio = PortfolioComposer.Compose(analyses);
+
+        Assert.Equal(2, portfolio.Grants.Count);
+        Assert.DoesNotContain(portfolio.Grants,
+            g => g.Duties.Count > 1 && g.Duties.Any(d => d.Contains("reporting")));
+    }
+
+    [Fact]
+    public void TwoReadOnlyDutiesStillFoldTogether()
+    {
+        // The barrier is about crossing read into write, not about refusing to merge reads.
+        var analyses = new[]
+        {
+            Duty("audit guests", RbacProviders.Directory, "AC - read users + signIns",
+                 "microsoft.directory/users/standard/read",
+                 "microsoft.directory/signInReports/allProperties/read")
+                 with { DeclaredReadOnly = true },
+            Duty("read users", RbacProviders.Directory, "AC - read users",
+                 "microsoft.directory/users/standard/read") with { DeclaredReadOnly = true }
+        };
+
+        Assert.Single(PortfolioComposer.Compose(analyses).Grants);
+    }
+
+    [Fact]
+    public void AWriteDutyStillFoldsIntoALargerWriteGrant()
+    {
+        // Nothing about the barrier should stop ordinary deduplication.
+        var analyses = new[]
+        {
+            Duty("amend users", RbacProviders.Directory, "AC - manage users",
+                 "microsoft.directory/users/basic/update",
+                 "microsoft.directory/users/assignLicense"),
+            Duty("assign licences", RbacProviders.Directory, "AC - assignLicense",
+                 "microsoft.directory/users/assignLicense")
+        };
+
+        Assert.Single(PortfolioComposer.Compose(analyses).Grants);
+    }
+
+    [Fact]
     public void OverlappingButNotContainedGrantsBothSurvive()
     {
         // Sharing a permission is not the same as being contained. Folding these would
@@ -215,6 +272,39 @@ public class PortfolioComposerTests
         Assert.True(portfolio.HasBlockingConcern);
         Assert.Contains(portfolio.Concerns,
             c => c.Title.Contains("escalation path", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void AMailingListIsNotHalfOfAnEscalationPath()
+    {
+        // Add-DistributionGroupMember manages a MAIL list. It grants access to nothing, so
+        // pairing it with password reset is not a route to privilege — and a blocking
+        // concern that is wrong teaches operators to dismiss the ones that are right.
+        var analyses = new[]
+        {
+            Duty("manage distribution lists", RbacProviders.Exchange, "AC - Exchange lists",
+                 "Add-DistributionGroupMember", "Remove-DistributionGroupMember"),
+            Duty("reset passwords", RbacProviders.Directory, "Helpdesk",
+                 "microsoft.directory/users/password/update")
+        };
+
+        Assert.DoesNotContain(PortfolioComposer.Compose(analyses).Concerns,
+            c => c.Title.Contains("escalation path", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ARoleGroupIsStillHalfOfAnEscalationPath()
+    {
+        // Exchange role groups DO carry permissions, so this pairing is real.
+        var analyses = new[]
+        {
+            Duty("manage role groups", RbacProviders.Exchange, "AC - Exchange roles",
+                 "Add-RoleGroupMember"),
+            Duty("reset passwords", RbacProviders.Directory, "Helpdesk",
+                 "microsoft.directory/users/password/update")
+        };
+
+        Assert.True(PortfolioComposer.Compose(analyses).HasBlockingConcern);
     }
 
     [Fact]

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using AccessCheck.Core.Catalog;
 
@@ -362,6 +362,40 @@ public sealed class ExoPurviewCatalogSync
         sb.AppendLine("    } catch { }");
         sb.AppendLine("  }");
 
+        // ONE NORMALISER FOR ALL THREE ENTRY PATHS.
+        //
+        // Each path returns the same information in a different shape, and each used to
+        // strip it — or not — on its own terms:
+        //
+        //   RoleEntries property   "RoleName\Get-Mailbox(-Identity, -Anr)"
+        //   Get-ManagementRoleEntry  "(Microsoft.Exchange.Management.PowerShell.E2010)
+        //                             Add-MailboxPermission -AccessRights -AutoMapping ..."
+        //
+        // The third path did not strip at all, so the catalog carried both a bare cmdlet
+        // name and a fully-qualified one depending on which path had supplied that role.
+        // Nothing downstream could match the second form, and the actions were reported as
+        // permissions Microsoft does not define while sitting in the catalog under a name
+        // no request would ever produce.
+        //
+        // Defined once here so a fourth path cannot quietly reintroduce a fourth format.
+        sb.AppendLine("  function AcNormalizeEntry($raw) {");
+        sb.AppendLine("    $t = [string]$raw");
+        sb.AppendLine("    if ($t -eq '') { return '' }");
+        // Module qualifier, when the REST session supplies one.
+        sb.AppendLine("    if ($t.StartsWith('(')) {");
+        sb.AppendLine("      $close = $t.IndexOf(')')");
+        sb.AppendLine("      if ($close -ge 0) { $t = $t.Substring($close + 1) }");
+        sb.AppendLine("    }");
+        sb.AppendLine("    $t = $t.Trim()");
+        // Parameters, in either shape: "Get-Mailbox(-Identity...)" or "Get-Mailbox -Identity...".
+        sb.AppendLine("    $t = $t.Split('(')[0]");
+        sb.AppendLine("    $space = $t.IndexOf(' ')");
+        sb.AppendLine("    if ($space -gt 0) { $t = $t.Substring(0, $space) }");
+        // "RoleName\Cmdlet" -> "Cmdlet".
+        sb.AppendLine("    if ($t.Contains('\\')) { $t = $t.Substring($t.LastIndexOf('\\') + 1) }");
+        sb.AppendLine("    return $t.Trim()");
+        sb.AppendLine("  }");
+
         sb.AppendLine("  $allRoles = @(Get-ManagementRole)");
         sb.AppendLine("  [Console]::Out.WriteLine('###PROGRESS###reading ' + $allRoles.Count + ' role(s)...')");
         sb.AppendLine("  $ri = 0");
@@ -373,12 +407,8 @@ public sealed class ExoPurviewCatalogSync
         // 1) RoleEntries on the object: values look like "Get-Mailbox(-Identity, -Anr...)"
         //    and may carry a "RoleName\" prefix; keep just the cmdlet name.
         sb.AppendLine("    if (($role.PSObject.Properties.Name -contains 'RoleEntries') -and $role.RoleEntries) {");
-        sb.AppendLine("      $entries = @($role.RoleEntries | ForEach-Object {");
-        sb.AppendLine("        $t = [string]$_");
-        sb.AppendLine("        $t = $t.Split('(')[0]");
-        sb.AppendLine("        if ($t.Contains('\\')) { $t = $t.Substring($t.LastIndexOf('\\') + 1) }");
-        sb.AppendLine("        $t.Trim()");
-        sb.AppendLine("      } | Where-Object { $_ -ne '' })");
+        sb.AppendLine("      $entries = @($role.RoleEntries |");
+        sb.AppendLine("        ForEach-Object { AcNormalizeEntry $_ } | Where-Object { $_ -ne '' })");
         sb.AppendLine("      if ($entries.Count -gt 0) { $entriesFromProperty++ }");
         sb.AppendLine("    }");
         // 2) Re-fetch the role BY IDENTITY. The LIST form of Get-ManagementRole returns a
@@ -390,12 +420,8 @@ public sealed class ExoPurviewCatalogSync
         sb.AppendLine("      try {");
         sb.AppendLine("        $full = Get-ManagementRole -Identity $role.Name -ErrorAction Stop");
         sb.AppendLine("        if ($full -and $full.RoleEntries) {");
-        sb.AppendLine("          $entries = @($full.RoleEntries | ForEach-Object {");
-        sb.AppendLine("            $t = [string]$_");
-        sb.AppendLine("            $t = $t.Split('(')[0]");
-        sb.AppendLine("            if ($t.Contains('\\')) { $t = $t.Substring($t.LastIndexOf('\\') + 1) }");
-        sb.AppendLine("            $t.Trim()");
-        sb.AppendLine("          } | Where-Object { $_ -ne '' })");
+        sb.AppendLine("          $entries = @($full.RoleEntries |");
+        sb.AppendLine("            ForEach-Object { AcNormalizeEntry $_ } | Where-Object { $_ -ne '' })");
         sb.AppendLine("          if ($entries.Count -gt 0) { $entriesFromIdentity++ }");
         sb.AppendLine("        }");
         sb.AppendLine("      } catch { }");
@@ -404,8 +430,20 @@ public sealed class ExoPurviewCatalogSync
         // 3) Fall back to the cmdlet only where it exists.
         sb.AppendLine("    if ($entries.Count -eq 0 -and $hasEntryCmdlet) {");
         sb.AppendLine("      try {");
+        // THE SAME NORMALISATION AS THE OTHER TWO PATHS. This one took $_.Name raw, and
+        // over the REST-based EXO v3 session that is not a cmdlet name — it is
+        // "(Microsoft.Exchange.Management.PowerShell.E2010) Add-MailboxPermission
+        // -AccessRights -AutoMapping ...", the module, the cmdlet and every parameter in
+        // one string.
+        //
+        // So the catalog held two formats at once: 466 bare cmdlet names from paths 1 and
+        // 2, and 2,734 fully-qualified strings from here. Whether an Exchange request
+        // worked depended on which path had happened to supply that particular role.
+        // Add-MailboxFolderPermission resolved; Add-MailboxPermission never did, and was
+        // reported as an action Microsoft does not define — while sitting in the catalog
+        // under a name nothing would ever match.
         sb.AppendLine("        $entries = @(Get-ManagementRoleEntry ($role.Name + '\\*') -ErrorAction Stop |");
-        sb.AppendLine("                     ForEach-Object { $_.Name })");
+        sb.AppendLine("                     ForEach-Object { AcNormalizeEntry $_.Name })");
         sb.AppendLine("        if ($entries.Count -gt 0) { $entriesFromCmdlet++ }");
         sb.AppendLine("      } catch { $entries = @() }");
         sb.AppendLine("    }");

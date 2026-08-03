@@ -664,6 +664,20 @@ public sealed class RecommendationValidator
     /// auditor needs six months later: "manage users authenticationMethods" says what the
     /// role does in a way "manage users" does not.
     /// </summary>
+    /// <summary>
+    /// Verbs too vague to improve on "manage". "update" describes almost every write in
+    /// Microsoft's vocabulary, so "AC - Entra ID update users" says no more than the
+    /// default while reading like it might.
+    /// </summary>
+    private static readonly string[] GenericVerbs = { "update", "allTasks", "read" };
+
+    /// <summary>The last path segment — the verb. Empty for cmdlets, which have no path.</summary>
+    private static string TerminalVerb(string action)
+    {
+        var slash = action.LastIndexOf('/');
+        return slash > 0 && slash < action.Length - 1 ? action[(slash + 1)..] : "";
+    }
+
     private static IEnumerable<string> Capabilities(string action)
     {
         // Cmdlets have no path shape — Add-MailboxFolderPermission is already specific.
@@ -695,6 +709,24 @@ public sealed class RecommendationValidator
         // flag devices/delete as privileged — it cannot make you an admin — but naming that
         // role "read devices" is plainly wrong, and the name is what an auditor sees.
         var verb = actions.All(a => !ActionRisk.IsWrite(a)) ? "read" : "manage";
+
+        // WHERE THE ACTIONS AGREE ON ONE VERB, SAY IT. "manage" is a fair summary of a
+        // mixed set and a poor name for a single-purpose role — and worse, it collides:
+        // users/create and users/basic/update both reduce to "AC - Entra ID manage users",
+        // two different grants under one name, which cannot both exist in the tenant.
+        // Capability encoding does not separate them because neither carries a capability
+        // segment ("basic" is a breadth qualifier and is stripped).
+        //
+        // Only when every action shares the verb. A role that creates AND deletes is
+        // genuinely "manage", and naming it after whichever verb came first would be worse
+        // than the collision.
+        var verbs = actions
+            .Select(TerminalVerb)
+            .Where(v => v.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (verbs.Count == 1 && !GenericVerbs.Contains(verbs[0], StringComparer.OrdinalIgnoreCase))
+            verb = verbs[0];
         var what = subjects.Count == 0
             ? actions.Count + " permission(s)"
             : string.Join(" + ", subjects);

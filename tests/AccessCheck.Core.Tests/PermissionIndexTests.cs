@@ -101,6 +101,87 @@ public class PermissionIndexTests
         Assert.Equal("microsoft.directory/users/disable", Assert.Single(top).Action);
     }
 
+    // ---------- specialised identity types ----------
+
+    [Fact]
+    public void AgentIdentityPermissionsAreNotOfferedToAStaffAccountRequest()
+    {
+        // agentUsers are identities for AI agents, and their action list mirrors the real
+        // one almost exactly. A duty to AMEND user accounts came back proposing eight of
+        // them; a duty to DISABLE user accounts was left with nothing once its single
+        // agentUsers proposal was stripped by the verifier.
+        var catalog = CatalogWith(
+            Role("r1", RbacProviders.Directory,
+                 "microsoft.directory/agentUsers/disable",
+                 "microsoft.directory/agentUsers/enable",
+                 "microsoft.directory/agentUsers/delete",
+                 "microsoft.directory/users/disable"));
+
+        var candidates = PermissionIndex.CandidateActions(
+            "disable user accounts for leavers", catalog);
+
+        Assert.DoesNotContain(candidates,
+            c => c.Action.Contains("agentUsers", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(candidates,
+            c => c.Action.Equals("microsoft.directory/users/disable",
+                                 StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ARequestAboutAgentsCanStillReachAgentPermissions()
+    {
+        // Suppressing a candidate makes it unreachable, so the gate has to open for a
+        // request that genuinely means agent identities.
+        var catalog = CatalogWith(
+            Role("r1", RbacProviders.Directory,
+                 "microsoft.directory/agentUsers/disable",
+                 "microsoft.directory/users/disable"));
+
+        var candidates = PermissionIndex.CandidateActions(
+            "disable agent identities that are no longer in use", catalog);
+
+        Assert.Contains(candidates,
+            c => c.Action.Contains("agentUsers", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void TheServiceScopedListingAlsoWithholdsAgentIdentities()
+    {
+        // THE PATH THAT ACTUALLY MATTERS. Once a service is identified the pipeline uses
+        // PermissionsInProviders, not CandidateActions — so gating only the latter left
+        // the real door open. agentUsers also sorts BEFORE users alphabetically, so it won
+        // the tie and took the slot: microsoft.directory/users/disable sat in the catalog
+        // and never appeared in a single prompt.
+        var catalog = CatalogWith(
+            Role("r1", RbacProviders.Directory,
+                 "microsoft.directory/agentUsers/disable",
+                 "microsoft.directory/users/disable"));
+
+        var offered = PermissionIndex.PermissionsInProviders(
+            new[] { RbacProviders.Directory }, catalog, "disable user accounts for leavers");
+
+        Assert.DoesNotContain(offered,
+            e => e.Action.Contains("agentUsers", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(offered,
+            e => e.Action.Equals("microsoft.directory/users/disable",
+                                 StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void TheServiceScopedListingStillOffersAgentsWhenAsked()
+    {
+        var catalog = CatalogWith(
+            Role("r1", RbacProviders.Directory,
+                 "microsoft.directory/agentUsers/disable",
+                 "microsoft.directory/users/disable"));
+
+        var offered = PermissionIndex.PermissionsInProviders(
+            new[] { RbacProviders.Directory }, catalog, "disable unused agent identities");
+
+        Assert.Contains(offered,
+            e => e.Action.Contains("agentUsers", StringComparison.OrdinalIgnoreCase));
+    }
+
     // ---------- determinism ----------
 
     private static RoleCatalog CatalogWith(params RoleDefinitionRecord[] roles)
